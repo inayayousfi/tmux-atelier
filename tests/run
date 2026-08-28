@@ -175,9 +175,13 @@ assert_equal 9 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through ss
 "$ROOT/tmux-atelier.tmux"
 assert_equal C-a "$("$TMUX" show-options -gv prefix)" 'HERDR prefix is configured'
 assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
-assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'remote@app' 'workspace line includes remote destination'
-assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'project@local' 'stopped workspace remains in status'
-assert_contains "$("$TMUX" show-options -gv 'status-format[1]')" 'range=window' 'window line is clickable'
+assert_equal bottom "$("$TMUX" show-options -gv status-position)" 'status bar is at the bottom'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'remote@app' 'workspace line includes remote destination'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'project@local' 'stopped workspace remains in status'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=window' 'window line is clickable'
+WINDOW_LINE=$("$TMUX" display-message -p -t '=remote:' "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')")
+FIRST_WINDOW=$("$TMUX" display-message -p -t '=remote:0' '#{window_index} #{window_name}')
+assert_contains "$WINDOW_LINE" "$FIRST_WINDOW" 'window line renders the first tab'
 "$TMUX" list-keys -T prefix | grep -F 'split vertical' >/dev/null || fail 'HERDR vertical split is bound'
 pass 'HERDR vertical split is bound'
 "$TMUX" list-keys -T prefix | grep -F 'popup-new' >/dev/null || fail 'workspace creation popup is bound'
@@ -188,14 +192,22 @@ pass 'left status click is bound'
 pass 'right workspace click is bound'
 "$TMUX" show-hooks -g session-created | grep -F 'refresh-status' >/dev/null || fail 'session hook refreshes status'
 pass 'session hook refreshes status'
+"$TMUX" new-session -d -s native-after-plugin 'sleep 120'
+for _ in {1..10}; do
+    HOOK_STATUS=$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')
+    [[ $HOOK_STATUS == *native-after-plugin@tmux* ]] && break
+    sleep 0.2
+done
+assert_contains "$HOOK_STATUS" 'native-after-plugin@tmux' 'session hook executes refresh-status with its argument'
 
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
 TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
-    "$CLI" status-click new
+    "$CLI" status-click new test-client
 mapfile -d '' -t POPUP_ARGS < "$COMMAND_LOG"
 assert_equal display-popup "${POPUP_ARGS[0]}" 'status plus opens a tmux popup'
-assert_contains "${POPUP_ARGS[6]}" 'popup-new' 'status plus runs the creation form inside the popup'
+assert_equal test-client "${POPUP_ARGS[2]}" 'status plus targets the client that clicked'
+assert_contains "${POPUP_ARGS[8]}" 'popup-new' 'status plus runs the creation form inside the popup'
 
 "$TMUX" new-window -d -t '=remote:' 'sleep 120'
 assert_equal 3 "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'

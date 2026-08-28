@@ -300,11 +300,11 @@ escape_format() {
 }
 
 clear_range_options() {
-    local option
-    while IFS= read -r option; do
+    local option value
+    while read -r option value; do
         [[ $option == @atelier_range_* ]] || continue
         tmux_cmd set-option -gu "$option" 2>/dev/null || true
-    done < <(tmux_cmd show-options -g -F '#{option_name}' 2>/dev/null || true)
+    done < <(tmux_cmd show-options -g 2>/dev/null || true)
 }
 
 workspace_label() {
@@ -355,12 +355,14 @@ status_line_for() {
 }
 
 command_refresh_status() {
-    local session line
+    local session line tabs
+    tabs=$(tmux_cmd show-options -gqv @atelier_tabs_format 2>/dev/null || true)
     clear_range_options
     while IFS= read -r session; do
         [[ -n $session ]] || continue
         line=$(status_line_for "$session")
-        tmux_cmd set-option -q -t "=$session:" 'status-format[0]' "$line"
+        tmux_cmd set-option -q -t "=$session:" 'status-format[0]' "$tabs"
+        tmux_cmd set-option -q -t "=$session:" 'status-format[1]' "$line"
     done < <(session_names)
 }
 
@@ -370,29 +372,37 @@ range_name() {
 }
 
 command_status_click() {
-    local token=${1:-} name
-    [[ $token == new ]] && { command_show_new_popup; return; }
+    local token=${1:-} client=${2:-} name
+    [[ $token == new ]] && { command_show_new_popup "$client"; return; }
     name=$(range_name "$token")
     [[ -n $name ]] || return 0
     if session_exists "$name"; then
-        tmux_cmd switch-client -t "=$name"
+        if [[ -n $client ]]; then
+            tmux_cmd switch-client -c "$client" -t "=$name"
+        else
+            tmux_cmd switch-client -t "=$name"
+        fi
     else
         command_open "$name"
     fi
 }
 
 command_show_new_popup() {
-    local cli qcli
+    local client=${1:-} cli qcli
     cli=$(cli_path)
     qcli=$(quote_sh "$cli")
-    tmux_cmd display-popup -E -w '70%' -h '60%' "$qcli popup-new"
+    if [[ -n $client ]]; then
+        tmux_cmd display-popup -c "$client" -E -w '70%' -h '60%' "$qcli popup-new"
+    else
+        tmux_cmd display-popup -E -w '70%' -h '60%' "$qcli popup-new"
+    fi
 }
 
 command_status_menu() {
-    local token=${1:-} name
+    local token=${1:-} client=${2:-} name
     name=$(range_name "$token")
     [[ -n $name ]] || return 0
-    command_menu "$name"
+    command_menu "$name" "$client"
 }
 
 cli_path() {
@@ -403,18 +413,26 @@ cli_path() {
 }
 
 command_menu() {
-    local name=${1:-} cli qcli qname
+    local name=${1:-} client=${2:-} cli qcli qname
+    local open rename edit close delete
     [[ -n $name ]] || die 'usage: tmux-atelier menu name'
     cli=$(cli_path)
     qcli=$(quote_sh "$cli")
     qname=$(quote_sh "$name")
-    tmux_cmd display-menu -T " $name " \
-        'Open' o "run-shell -b $qcli open $qname" \
-        'Rename' r "display-popup -E -w 60% -h 30% $qcli popup-rename $qname" \
-        'Edit target' e "display-popup -E -w 70% -h 35% $qcli popup-edit $qname" \
+    open=$(quote_sh "$qcli open $qname")
+    rename=$(quote_sh "$qcli popup-rename $qname")
+    edit=$(quote_sh "$qcli popup-edit $qname")
+    close=$(quote_sh "$qcli request-close $qname")
+    delete=$(quote_sh "$qcli request-delete $qname")
+    local -a menu_args=(display-menu)
+    [[ -n $client ]] && menu_args+=(-c "$client")
+    tmux_cmd "${menu_args[@]}" -T " $name " \
+        'Open' o "run-shell -b $open" \
+        'Rename' r "display-popup -E -w 60% -h 30% $rename" \
+        'Edit target' e "display-popup -E -w 70% -h 35% $edit" \
         '' \
-        'Close session' x "run-shell -b $qcli request-close $qname" \
-        'Delete definition' d "run-shell -b $qcli request-delete $qname"
+        'Close session' x "run-shell -b $close" \
+        'Delete definition' d "run-shell -b $delete"
 }
 
 command_close() {
@@ -434,17 +452,19 @@ command_delete() {
 }
 
 command_request_close() {
-    local name=${1:-} cli qcli qname
+    local name=${1:-} cli qcli qname command
     validate_name "$name"
     cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
-    tmux_cmd confirm-before -p "Close session $name? (y/n)" "run-shell -b $qcli close $qname"
+    command=$(quote_sh "$qcli close $qname")
+    tmux_cmd confirm-before -p "Close session $name? (y/n)" "run-shell -b $command"
 }
 
 command_request_delete() {
-    local name=${1:-} cli qcli qname
+    local name=${1:-} cli qcli qname command
     validate_name "$name"
     cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
-    tmux_cmd confirm-before -p "Delete definition $name? (y/n)" "run-shell -b $qcli delete $qname"
+    command=$(quote_sh "$qcli delete $qname")
+    tmux_cmd confirm-before -p "Delete definition $name? (y/n)" "run-shell -b $command"
 }
 
 command_rename() {
@@ -611,9 +631,9 @@ main() {
         popup-rename) (($# == 1)) || die 'usage: tmux-atelier popup-rename name'; command_popup_rename "$@" ;;
         popup-edit) (($# == 1)) || die 'usage: tmux-atelier popup-edit name'; command_popup_edit "$@" ;;
         refresh-status) (($# == 0)) || die 'usage: tmux-atelier refresh-status'; command_refresh_status ;;
-        status-click) (($# == 1)) || die 'usage: tmux-atelier status-click range'; command_status_click "$@" ;;
-        status-menu) (($# == 1)) || die 'usage: tmux-atelier status-menu range'; command_status_menu "$@" ;;
-        menu) (($# == 1)) || die 'usage: tmux-atelier menu name'; command_menu "$@" ;;
+        status-click) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier status-click range [client]'; command_status_click "$@" ;;
+        status-menu) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier status-menu range [client]'; command_status_menu "$@" ;;
+        menu) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier menu name [client]'; command_menu "$@" ;;
         request-close) (($# == 1)) || die 'usage: tmux-atelier request-close name'; command_request_close "$@" ;;
         request-delete) (($# == 1)) || die 'usage: tmux-atelier request-delete name'; command_request_delete "$@" ;;
         help|-h|--help) (($# == 0)) || die 'usage: tmux-atelier help'; usage ;;
