@@ -3,4 +3,35 @@
 set -euo pipefail
 : "${TMUX_ATELIER_SSH_LOG:?}"
 printf '%s\0' "$@" >> "$TMUX_ATELIER_SSH_LOG"
-exec sleep 120
+
+if [[ ${1:-} == -G ]]; then
+    destination=${!#}
+    case $destination in
+        included)
+            printf 'user deploy\nhostname app.internal\nport 2200\n'
+            ;;
+        *)
+            printf 'user remote\nhostname %s\nport 22\n' "$destination"
+            ;;
+    esac
+    exit 0
+fi
+
+for argument in "$@"; do
+    [[ $argument == -t ]] && exec sleep 120
+done
+
+command=${!#}
+# Match the literal remote command; expansion happens on the fake remote.
+# shellcheck disable=SC2016
+if [[ $command == *'printf "%s\n" "$HOME"'* ]]; then
+    printf '/home/remote\n'
+elif [[ $command == *'pwd -P'* ]]; then
+    printf '%s\n' "${TMUX_ATELIER_REMOTE_CANONICAL:-/mnt/data}"
+elif [[ $command == *'for entry in'* ]]; then
+    if [[ $command == *'/home/remote/work dir'* ]]; then
+        printf '.hidden\n'
+    elif [[ $command == *'/home/remote'* ]]; then
+        printf '.config\nwork dir\n'
+    fi
+fi

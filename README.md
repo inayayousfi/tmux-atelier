@@ -32,6 +32,8 @@ deploy@app01:/srv/app
 
 Destinations may contain ASCII letters, digits, `.`, `_`, `-`, and `@`. Define an alias in `~/.ssh/config` for a raw IPv6 address because `:` separates the destination from the path.
 
+Remote commands use OpenSSH connection sharing with `ControlMaster=auto` and a one-minute `ControlPersist`. Private control sockets live under the tmux-atelier state directory. Authentication, host verification, keys, agents, ports, jump hosts, and other connection settings remain under OpenSSH control; tmux-atelier never reads or stores credentials.
+
 Paths may contain spaces, apostrophes, and `=` signs. They may not contain newlines. A local path must be an existing directory. The remote machine checks a remote path when SSH connects.
 
 ## Saved Workspaces
@@ -91,7 +93,11 @@ The upper status line shows the windows in the active session and ends with a `+
 
 The lower status line shows saved workspaces and native tmux sessions. The current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens an FZF menu for renaming, closing, or deleting its saved definition. Right-clicking a tab opens an FZF menu for renaming or closing it. Destructive actions require confirmation.
 
-The creation popup offers `local`, aliases found in `~/.ssh/config`, and a destination entered directly. It then asks for the path and an optional name. The workspace picker selects a workspace, tab, and split in order. Tab and split menus include `< Back`, and each stage previews the selected terminal.
+The creation popup uses one machine list containing the local machine, concrete SSH aliases found through `Host` and `Include` directives in `~/.ssh/config`, and a custom SSH destination. Aliases show the user, hostname, and port resolved by `ssh -G`; custom destinations accept an alias or `user@host`.
+
+After choosing a machine, the directory browser starts at its home directory. It can select the current directory, descend into normal or hidden directories, follow directory symlinks, move up to `/`, or return to the machine screen. Typing a relative, `~/...`, or absolute path directly into the FZF prompt creates missing directories recursively and selects the resulting path. Remote directories are created and checked through SSH. The final prompt proposes a workspace name derived from the selected directory and allows editing it.
+
+The workspace picker selects a workspace, tab, and split in order. Tab and split menus include `< Back`, and each stage previews the selected terminal.
 
 The key bindings follow HERDR:
 

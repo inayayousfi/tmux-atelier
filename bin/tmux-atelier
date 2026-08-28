@@ -11,6 +11,7 @@ WORKSPACE_NAME=
 WORKSPACE_DESTINATION=
 WORKSPACE_PATH=
 declare -A SSH_CONFIG_SEEN=()
+declare -a SSH_COMMON_ARGS=()
 
 die() {
     printf 'tmux-atelier: %s\n' "$*" >&2
@@ -155,13 +156,38 @@ quote_sh() {
     printf "'%s'" "$value"
 }
 
+prepare_ssh_args() {
+    local control_dir="$STATE_ROOT/ssh"
+    mkdir -p "$control_dir"
+    chmod 700 "$control_dir"
+    SSH_COMMON_ARGS=(
+        -o ControlMaster=auto
+        -o ControlPersist=60
+        -o "ControlPath=$control_dir/%C"
+    )
+}
+
+ssh_cmd() {
+    local destination=$1
+    shift
+    prepare_ssh_args
+    # Remaining arguments are remote commands and must be expanded by OpenSSH.
+    # shellcheck disable=SC2029
+    ssh "${SSH_COMMON_ARGS[@]}" "$destination" "$@"
+}
+
 remote_shell_command() {
-    local destination=$1 path=$2 remote command inner
+    local destination=$1 path=$2 remote command inner argument
     # $1 and $SHELL are intentionally expanded by the remote POSIX shell.
     # shellcheck disable=SC2016
     inner='cd -- "$1" && exec "${SHELL:-/bin/sh}" -l'
     remote="sh -c $(quote_sh "$inner") sh $(quote_sh "$path")"
-    command="exec ssh -t $(quote_sh "$destination") $(quote_sh "$remote")"
+    prepare_ssh_args
+    command='exec ssh'
+    for argument in "${SSH_COMMON_ARGS[@]}"; do
+        command+=" $(quote_sh "$argument")"
+    done
+    command+=" -t $(quote_sh "$destination") $(quote_sh "$remote")"
     printf '%s\n' "$command"
 }
 
@@ -410,7 +436,8 @@ command_show_new_popup() {
     cli=$(cli_path)
     qcli=$(quote_sh "$cli")
     if [[ -n $client ]]; then
-        tmux_cmd display-popup -c "$client" -E -w '70%' -h '60%' "$qcli popup-new"
+        tmux_cmd display-popup -c "$client" -e "TMUX_ATELIER_CLIENT=$client" \
+            -E -w '70%' -h '60%' "$qcli popup-new"
     else
         tmux_cmd display-popup -E -w '70%' -h '60%' "$qcli popup-new"
     fi
@@ -642,7 +669,7 @@ command_edit() {
 
 ssh_aliases_from() {
     local file=$1 line keyword rest pattern include base expanded
-    local -a lines
+    local -a lines patterns includes
     [[ -f $file ]] || return 0
     file=$(readlink -f "$file")
     [[ -z ${SSH_CONFIG_SEEN[$file]:-} ]] || return 0
@@ -653,13 +680,15 @@ ssh_aliases_from() {
         read -r keyword rest <<< "$line"
         case ${keyword,,} in
             host)
-                for pattern in $rest; do
+                read -r -a patterns <<< "$rest"
+                for pattern in "${patterns[@]}"; do
                     [[ $pattern != *['*?!']* && $pattern != '!'* ]] && printf '%s\n' "$pattern"
                 done
                 ;;
             include)
                 base=${file%/*}
-                for include in $rest; do
+                read -r -a includes <<< "$rest"
+                for include in "${includes[@]}"; do
                     include=${include/#\~/$HOME}
                     [[ $include == /* ]] || include="$base/$include"
                     while IFS= read -r expanded; do
@@ -671,32 +700,242 @@ ssh_aliases_from() {
     done
 }
 
-choose_destination() {
-    local output selected
-    output=$({ printf 'local\n'; ssh_aliases_from "$HOME/.ssh/config"; } |
-        LC_ALL=C sort -u |
-        fzf --print-query --bind=enter:accept --prompt='Destination > ' --height=100% --border)
-    selected=${output##*$'\n'}
-    [[ -n $selected ]] || selected=$output
-    validate_destination "$selected"
-    printf '%s\n' "$selected"
+ssh_alias_choice() {
+    local alias=$1 config key value user='' hostname='' port=''
+    config=$(ssh -G -- "$alias" 2>/dev/null) || return 0
+    while read -r key value; do
+        case $key in
+            user) [[ -n $user ]] || user=$value ;;
+            hostname) [[ -n $hostname ]] || hostname=$value ;;
+            port) [[ -n $port ]] || port=$value ;;
+        esac
+    done <<< "$config"
+    [[ -n $user && -n $hostname ]] || return 0
+    debug_log "new-workspace ssh-alias alias=$alias resolved=$user@$hostname:${port:-22}"
+    printf 'alias\t%s  %s@%s:%s\t%s\n' "$alias" "$user" "$hostname" "${port:-22}" "$alias"
+}
+
+choose_machine() {
+    local choice alias choices
+    SSH_CONFIG_SEEN=()
+    choices=$({
+        printf 'local\tLocal\tlocal\ncustom\tCustom SSH destination\t\n'
+        while IFS= read -r alias; do
+            [[ -n $alias ]] && ssh_alias_choice "$alias"
+        done < <(ssh_aliases_from "$HOME/.ssh/config" | LC_ALL=C sort -u)
+        true
+    })
+    debug_log "new-workspace machine-fzf started rows=$(printf '%q' "$choices")"
+    if ! choice=$(FZF_DEFAULT_COMMAND=false fzf --delimiter=$'\t' --with-nth=2 \
+        --prompt='Machine > ' --height=100% --border --no-info <<< "$choices"); then
+        debug_log 'new-workspace machine-fzf cancelled'
+        return 1
+    fi
+    debug_log "new-workspace machine-fzf selected=$(printf '%q' "$choice")"
+    printf '%s\n' "$choice"
+}
+
+canonical_local_path() {
+    local path=$1
+    [[ -d $path ]] || return 1
+    (cd -- "$path" && pwd -P)
+}
+
+create_local_path() {
+    local path=$1
+    mkdir -p -- "$path"
+    canonical_local_path "$path"
+}
+
+create_remote_path() {
+    local destination=$1 path=$2 inner remote
+    # $1 is expanded by the remote shell.
+    # shellcheck disable=SC2016
+    inner='mkdir -p -- "$1" && cd -- "$1" && pwd -P'
+    remote="sh -c $(quote_sh "$inner") sh $(quote_sh "$path")"
+    ssh_cmd "$destination" "$remote"
+}
+
+remote_home() {
+    local destination=$1
+    # $HOME is expanded by the remote shell.
+    # shellcheck disable=SC2016
+    ssh_cmd "$destination" 'printf "%s\n" "$HOME"'
+}
+
+local_directories() {
+    (
+        local path=$1 entry name
+        local -a entries
+        shopt -s nullglob dotglob
+        entries=("$path"/*)
+        {
+            for entry in "${entries[@]}"; do
+                name=${entry##*/}
+                [[ -d $entry && $name != *$'\n'* ]] && printf '%s\n' "$name"
+            done
+            true
+        } | LC_ALL=C sort
+    )
+}
+
+remote_directories() {
+    local destination=$1 path=$2 inner remote
+    # Variables in this script are expanded by the remote shell.
+    # shellcheck disable=SC2016
+    inner='cd -- "$1" 2>/dev/null || exit 1
+for entry in ./* ./.[!.]* ./..?*; do
+    [ -d "$entry" ] || continue
+    name=${entry#./}
+    case $name in *"
+"*) continue ;; esac
+    printf "%s\n" "$name"
+done'
+    remote="sh -c $(quote_sh "$inner") sh $(quote_sh "$path")"
+    ssh_cmd "$destination" "$remote" | LC_ALL=C sort -u
+}
+
+resolve_custom_path() {
+    local home=$1 input=$2 tilde='~'
+    case $input in
+        "$tilde") printf '%s\n' "$home" ;;
+        "$tilde/"*) printf '%s/%s\n' "${home%/}" "${input#\~/}" ;;
+        /*) printf '%s\n' "$input" ;;
+        *) printf '%s/%s\n' "${home%/}" "$input" ;;
+    esac
+}
+
+parent_path() {
+    local path=${1%/}
+    [[ $path != / ]] || { printf '/\n'; return; }
+    path=${path%/*}
+    printf '%s\n' "${path:-/}"
+}
+
+display_path() {
+    local home=$1 path=$2 tilde='~'
+    if [[ $path == "$home" ]]; then
+        printf '%s/\n' "$tilde"
+    elif [[ $path == "$home"/* ]]; then
+        printf '%s/%s\n' "$tilde" "${path#"$home"/}"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+choose_directory() {
+    local destination=$1 home=$2 current=$2 result query choice choice_type candidate name prompt directories choices
+    while true; do
+        if [[ $destination == local ]]; then
+            directories=$(local_directories "$current") || return 1
+        else
+            directories=$(remote_directories "$destination" "$current") || {
+                printf 'Could not list remote directory: %s\n' "$current" >&2
+                return 1
+            }
+        fi
+        prompt="$(display_path "$home" "$current") > "
+        choices=$({
+            printf 'select\t< Select this folder>\nback\t< Back>\n'
+            [[ $current == / ]] || printf 'up\t< Up>\n'
+            if [[ -n $directories ]]; then
+                while IFS= read -r name; do
+                    printf 'directory\t%s\n' "$name"
+                done <<< "$directories"
+            fi
+            true
+        })
+        debug_log "new-workspace directory-fzf started destination=$destination current=$(printf '%q' "$current") rows=$(printf '%q' "$choices")"
+        if ! result=$(FZF_DEFAULT_COMMAND=false fzf --delimiter=$'\t' --with-nth=2.. \
+            --prompt="$prompt" --height=100% --border --no-info --print-query \
+            --bind='enter:accept-or-print-query' <<< "$choices"); then
+            debug_log "new-workspace directory-fzf cancelled destination=$destination current=$(printf '%q' "$current")"
+            return 1
+        fi
+        query=${result%%$'\n'*}
+        if [[ $result == *$'\n'* ]]; then
+            choice=${result#*$'\n'}
+        else
+            choice=
+        fi
+        debug_log "new-workspace directory-fzf selected destination=$destination current=$(printf '%q' "$current") query=$(printf '%q' "$query") choice=$(printf '%q' "$choice")"
+
+        if [[ $choice != *$'\t'* ]]; then
+            [[ -n $query ]] || continue
+            candidate=$(resolve_custom_path "$home" "$query")
+            if [[ $destination == local ]]; then
+                create_local_path "$candidate"
+            else
+                create_remote_path "$destination" "$candidate"
+            fi
+            return
+        fi
+
+        choice_type=${choice%%$'\t'*}
+        case $choice_type in
+            select) printf '%s\n' "$current"; return 0 ;;
+            back) return 2 ;;
+            up) current=$(parent_path "$current") ;;
+            directory)
+                name=${choice#*$'\t'}
+                [[ $current == / ]] && current="/$name" || current="$current/$name"
+                ;;
+        esac
+    done
 }
 
 command_popup_new() {
-    local destination path name target
-    destination=$(choose_destination) || return 0
-    if [[ $destination == local ]]; then
-        read -r -e -p 'Path: ' -i "$PWD" path || return 0
-    else
-        read -r -e -p 'Remote path: ' path || return 0
-    fi
-    read -r -e -p 'Name (optional): ' name || return 0
-    target="$destination:$path"
-    if [[ -n $name ]]; then
-        command_new "$target" "$name"
-    else
-        command_new "$target"
-    fi
+    local machine machine_type destination home path suggested name status target
+    local client=${TMUX_ATELIER_CLIENT:-}
+    while true; do
+        machine=$(choose_machine) || return 0
+        machine_type=${machine%%$'\t'*}
+        destination=${machine##*$'\t'}
+        debug_log "new-workspace machine-type=$machine_type destination=$destination"
+        case $machine_type in
+            local)
+                destination=local
+                home=$HOME
+                ;;
+            custom)
+                read -r -e -p 'OpenSSH destination (user@host or alias): ' destination || continue
+                validate_destination "$destination"
+                home=$(remote_home "$destination") || {
+                    printf 'Could not connect to %s.\n' "$destination" >&2
+                    continue
+                }
+                ;;
+            alias)
+                validate_destination "$destination"
+                home=$(remote_home "$destination") || {
+                    printf 'Could not connect to %s.\n' "$destination" >&2
+                    continue
+                }
+                ;;
+            *) continue ;;
+        esac
+        if path=$(choose_directory "$destination" "$home"); then
+            status=0
+        else
+            status=$?
+        fi
+        ((status == 0)) || {
+            debug_log "new-workspace directory status=$status destination=$destination"
+            ((status == 2)) && continue
+            return 0
+        }
+        suggested=$(normalise_name "$path")
+        read -r -e -p 'Workspace name: ' -i "$suggested" name || continue
+        debug_log "new-workspace name-submitted length=${#name} destination=$destination path=$(printf '%q' "$path")"
+        target="$destination:$path"
+        command_new "$target" "$name" --detached
+        if [[ -n $client ]]; then
+            tmux_cmd switch-client -c "$client" -t "=$name"
+        else
+            select_session "$name"
+        fi
+        return
+    done
 }
 
 workspace_choices() {

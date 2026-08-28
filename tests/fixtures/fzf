@@ -2,14 +2,39 @@
 
 set -euo pipefail
 : "${TMUX_ATELIER_FZF_LOG:?}"
+FZF_ARGUMENTS=$*
 printf '%s\n' "$*" >> "$TMUX_ATELIER_FZF_LOG"
 mapfile -t choices
 if [[ -n ${TMUX_ATELIER_FZF_INPUT_LOG:-} ]]; then
     printf '%s\n' "${choices[@]}" >> "$TMUX_ATELIER_FZF_INPUT_LOG"
 fi
 [[ ${TMUX_ATELIER_FZF_CANCEL:-0} != 1 ]] || exit 1
+
+emit_selection() {
+    local selected=$1 query=${TMUX_ATELIER_FZF_QUERY:-}
+    if [[ " $FZF_ARGUMENTS " == *' --print-query '* ]]; then
+        printf '%s\n' "$query"
+        if [[ $selected == __QUERY__ ]]; then
+            printf '%s\n' "$query"
+            return
+        fi
+    fi
+    printf '%s\n' "$selected"
+}
+
 if [[ -n ${TMUX_ATELIER_FZF_CHOICE:-} ]]; then
-    printf '%s\n' "$TMUX_ATELIER_FZF_CHOICE"
+    emit_selection "$TMUX_ATELIER_FZF_CHOICE"
     exit 0
 fi
-printf '%s\n' "${choices[0]}"
+if [[ -n ${TMUX_ATELIER_FZF_CHOICES_FILE:-} && -f $TMUX_ATELIER_FZF_CHOICES_FILE ]]; then
+    mapfile -t scripted_choices < "$TMUX_ATELIER_FZF_CHOICES_FILE"
+    ((${#scripted_choices[@]})) || exit 1
+    if ((${#scripted_choices[@]} > 1)); then
+        printf '%s\n' "${scripted_choices[@]:1}" > "$TMUX_ATELIER_FZF_CHOICES_FILE"
+    else
+        : > "$TMUX_ATELIER_FZF_CHOICES_FILE"
+    fi
+    emit_selection "${scripted_choices[0]}"
+    exit 0
+fi
+emit_selection "${choices[0]}"

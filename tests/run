@@ -14,6 +14,11 @@ COMMAND_LOG="$TEST_ROOT/tmux-command.log"
 FZF_LOG="$TEST_ROOT/fzf.log"
 FZF_INPUT_LOG="$TEST_ROOT/fzf-input.log"
 PICKER_LOG="$TEST_ROOT/picker.log"
+WIZARD_HOME="$TEST_ROOT/wizard-home"
+WIZARD_CHOICES="$TEST_ROOT/wizard-choices"
+WIZARD_FZF_LOG="$TEST_ROOT/wizard-fzf.log"
+WIZARD_INPUT_LOG="$TEST_ROOT/wizard-input.log"
+TILDE_CHARACTER='~'
 
 export TMUX_ATELIER_TEST_SOCKET="atelier-test-$$"
 export TMUX_ATELIER_REAL_TMUX
@@ -54,8 +59,19 @@ assert_contains() {
     pass "$message"
 }
 
+assert_not_contains() {
+    local value=$1 unexpected=$2 message=$3
+    [[ $value != *"$unexpected"* ]] || fail "$message (unexpected '$unexpected' in '$value')"
+    pass "$message"
+}
+
 assert_file() {
     [[ -f $1 ]] || fail "$2"
+    pass "$2"
+}
+
+assert_directory() {
+    [[ -d $1 ]] || fail "$2"
     pass "$2"
 }
 
@@ -78,7 +94,13 @@ quote_sh() {
     printf "'%s'" "$value"
 }
 
-mkdir -p "$TEST_BIN" "$LOCAL_ONE" "$LOCAL_TWO"
+mkdir -p "$TEST_BIN" "$LOCAL_ONE" "$LOCAL_TWO" \
+    "$WIZARD_HOME/projects/.hidden/< Back>" "$WIZARD_HOME/.ssh/config.d"
+printf 'Include config.d/*\n' > "$WIZARD_HOME/.ssh/config"
+printf 'Host included\n  User deploy\n  HostName app.internal\n  Port 2200\n\nHost custom\n' \
+    > "$WIZARD_HOME/.ssh/config.d/hosts"
+printf 'Host *\n  IdentityAgent ~/.ssh/agent.sock\n' >> "$WIZARD_HOME/.ssh/config"
+printf 'not a directory\n' > "$WIZARD_HOME/zzz-file"
 cp "$ROOT/tests/fixtures/tmux" "$TEST_BIN/tmux"
 cp "$ROOT/tests/fixtures/ssh" "$TEST_BIN/ssh"
 chmod +x "$TEST_BIN/tmux" "$TEST_BIN/ssh"
@@ -163,13 +185,17 @@ REMOTE_PATH="/srv/app dir/it's"
 "$CLI" new "deploy@app:$REMOTE_PATH" remote --detached
 sleep 0.1
 mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
-assert_equal -t "${SSH_ARGS[0]}" 'ssh requests a pseudo-terminal'
-assert_equal deploy@app "${SSH_ARGS[1]}" 'ssh receives the OpenSSH destination'
+assert_equal -o "${SSH_ARGS[0]}" 'ssh configures shared connections'
+assert_equal ControlMaster=auto "${SSH_ARGS[1]}" 'ssh enables automatic connection sharing'
+assert_equal ControlPersist=60 "${SSH_ARGS[3]}" 'ssh keeps an idle master for one minute'
+assert_contains "${SSH_ARGS[5]}" 'ControlPath=' 'ssh uses a private control socket'
+assert_equal -t "${SSH_ARGS[6]}" 'ssh requests a pseudo-terminal'
+assert_equal deploy@app "${SSH_ARGS[7]}" 'ssh receives the OpenSSH destination'
 # The fake remote shell, not this test process, expands these variables.
 # shellcheck disable=SC2016
 REMOTE_INNER='cd -- "$1" && exec "${SHELL:-/bin/sh}" -l'
 EXPECTED_REMOTE="sh -c $(quote_sh "$REMOTE_INNER") sh $(quote_sh "$REMOTE_PATH")"
-assert_equal "$EXPECTED_REMOTE" "${SSH_ARGS[2]}" 'remote command preserves spaces and apostrophe'
+assert_equal "$EXPECTED_REMOTE" "${SSH_ARGS[8]}" 'remote command preserves spaces and apostrophe'
 assert_equal deploy@app "$("$TMUX" show-options -qv -t '=remote:' @atelier_destination)" 'remote destination is stored in tmux'
 
 "$CLI" window remote
@@ -177,7 +203,7 @@ PANE=$("$TMUX" display-message -p -t '=remote:1' '#{pane_id}')
 "$CLI" split horizontal "$PANE"
 sleep 0.1
 mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
-assert_equal 9 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through ssh'
+assert_equal 27 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through shared ssh'
 
 "$ROOT/tmux-atelier.tmux"
 assert_equal C-a "$("$TMUX" show-options -gv prefix)" 'HERDR prefix is configured'
@@ -245,7 +271,8 @@ TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
 mapfile -d '' -t POPUP_ARGS < "$COMMAND_LOG"
 assert_equal display-popup "${POPUP_ARGS[0]}" 'status plus opens a tmux popup'
 assert_equal test-client "${POPUP_ARGS[2]}" 'status plus targets the client that clicked'
-assert_contains "${POPUP_ARGS[8]}" 'popup-new' 'status plus runs the creation form inside the popup'
+assert_contains "${POPUP_ARGS[*]}" 'TMUX_ATELIER_CLIENT=test-client' 'status plus passes the originating client'
+assert_contains "${POPUP_ARGS[*]}" 'popup-new' 'status plus runs the creation form inside the popup'
 
 : > "$COMMAND_LOG"
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
@@ -346,6 +373,96 @@ PATH="$ROOT/tests/fixtures:$PATH" \
 assert_contains "$(< "$MENU_FZF_LOG")" '%1 > ' 'tab actions use FZF'
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename tab' 'tab FZF menu offers rename'
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Close tab' 'tab FZF menu offers close'
+
+sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=remote' > "$TEST_ROOT/wizard-client.log" 2>&1 &
+WIZARD_CLIENT_PID=$!
+WIZARD_CLIENT=
+for _ in {1..10}; do
+    WIZARD_CLIENT=$("$TMUX" list-clients -F '#{client_name}' 2>/dev/null || true)
+    [[ -n $WIZARD_CLIENT ]] && break
+    sleep 0.1
+done
+[[ -n $WIZARD_CLIENT ]] || fail "control client starts for creation wizard: $(< "$TEST_ROOT/wizard-client.log")"
+
+printf '%s\n' $'local\tLocal\tlocal' $'directory\tprojects' $'directory\t.hidden' \
+    $'directory\t< Back>' $'select\t< Select this folder>' > "$WIZARD_CHOICES"
+printf 'local-wizard\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_contains "$(< "$STATE_DIR/workspaces/local-wizard")" 'destination=local' 'creation wizard creates a local workspace'
+assert_contains "$(< "$STATE_DIR/workspaces/local-wizard")" "path=$WIZARD_HOME/projects/.hidden/< Back>" 'directory names cannot collide with browser actions'
+assert_contains "$(< "$WIZARD_FZF_LOG")" 'Machine > ' 'creation wizard separates the machine type screen'
+assert_contains "$(< "$WIZARD_FZF_LOG")" "$TILDE_CHARACTER/ > " 'local directory browser starts at home'
+assert_not_contains "$(< "$WIZARD_INPUT_LOG")" 'zzz-file' 'local browser ignores files without failing'
+
+printf '%s\n' $'local\tLocal\tlocal' '__QUERY__' > "$WIZARD_CHOICES"
+printf 'local-created\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_FZF_QUERY="$TILDE_CHARACTER/new/project" \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_directory "$WIZARD_HOME/new/project" 'typed local path is created recursively'
+assert_contains "$(< "$STATE_DIR/workspaces/local-created")" "path=$WIZARD_HOME/new/project" 'typed local path becomes the workspace target'
+
+: > "$WIZARD_FZF_LOG"
+: > "$WIZARD_INPUT_LOG"
+printf '%s\n' $'alias\tincluded  deploy@app.internal:2200\tincluded' \
+    $'directory\twork dir' $'select\t< Select this folder>' > "$WIZARD_CHOICES"
+printf 'remote-wizard\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_contains "$(< "$WIZARD_INPUT_LOG")" 'included  deploy@app.internal:2200' 'machine screen resolves included OpenSSH aliases'
+assert_not_contains "$(< "$WIZARD_INPUT_LOG")" 'README.md' 'wildcard SSH hosts do not expand to local files'
+assert_contains "$(< "$WIZARD_INPUT_LOG")" '.config' 'remote browser includes hidden directories'
+assert_contains "$(< "$STATE_DIR/workspaces/remote-wizard")" 'destination=included' 'remote wizard preserves the selected OpenSSH alias'
+assert_contains "$(< "$STATE_DIR/workspaces/remote-wizard")" 'path=/home/remote/work dir' 'remote browser selects a path containing spaces'
+
+printf '%s\n' $'custom\tCustom SSH destination\t' '__QUERY__' > "$WIZARD_CHOICES"
+printf 'custom@app\ncustom-wizard\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_REMOTE_CANONICAL='/mnt/data' \
+    TMUX_ATELIER_FZF_QUERY='/mnt/data' \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_contains "$(< "$STATE_DIR/workspaces/custom-wizard")" 'destination=custom@app' 'remote wizard accepts a custom user and host'
+assert_contains "$(< "$STATE_DIR/workspaces/custom-wizard")" 'path=/mnt/data' 'remote wizard accepts and validates an absolute custom path'
+mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
+assert_contains "${SSH_ARGS[*]}" 'mkdir -p' 'typed remote path is created recursively over SSH'
+
+printf '%s\n' $'alias\tcustom  remote@custom:22\tcustom' \
+    $'select\t< Select this folder>' > "$WIZARD_CHOICES"
+printf 'alias-custom-wizard\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_contains "$(< "$STATE_DIR/workspaces/alias-custom-wizard")" 'destination=custom' 'OpenSSH aliases cannot collide with remote screen actions'
+[[ ! -s $WIZARD_CHOICES ]] || fail 'scripted FZF choices are exhausted exactly'
+pass 'scripted FZF choices are exhausted exactly'
+
+"$TMUX" detach-client -t "$WIZARD_CLIENT"
+wait "$WIZARD_CLIENT_PID" 2>/dev/null || true
 
 "$TMUX" new-window -d -t '=remote:' 'sleep 120'
 assert_equal "$((WINDOWS_AFTER + 1))" "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'

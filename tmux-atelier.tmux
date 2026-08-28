@@ -35,7 +35,8 @@ tmux set-option -g 'status-format[1]' '#[range=user|new,bold] + #[default,norang
 
 tmux bind-key a display-popup -c '#{client_name}' -e 'TMUX_ATELIER_CLIENT=#{client_name}' \
     -E -w '70%' -h '60%' "$QCLI picker"
-tmux bind-key n display-popup -E -w '70%' -h '60%' "$QCLI popup-new"
+tmux bind-key n display-popup -c '#{client_name}' -e 'TMUX_ATELIER_CLIENT=#{client_name}' \
+    -E -w '70%' -h '60%' "$QCLI popup-new"
 tmux bind-key t run-shell -b "exec $QCLI window \"#{session_name}\""
 tmux bind-key r run-shell "$QPLUGIN"
 tmux unbind-key + 2>/dev/null || true
