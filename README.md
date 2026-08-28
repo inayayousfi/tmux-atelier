@@ -16,12 +16,6 @@ The repository is self-contained. Add the following line to your tmux configurat
 run-shell /path/to/tmux-atelier/tmux-atelier.tmux
 ```
 
-For this checkout, the line is:
-
-```tmux
-run-shell /home/iy/Projets/tmux-atelier/tmux-atelier.tmux
-```
-
 Reload the configuration or restart the tmux server. tmux-atelier sets `Ctrl-a` as the prefix and enables mouse support. It does not edit `~/.tmux.conf` itself.
 
 ## Targets
@@ -93,9 +87,9 @@ A target cannot be edited while its session is alive. Close the session before r
 
 ## tmux Interface
 
-The first status line shows saved workspaces and native tmux sessions. The current workspace uses reverse video, a live session is bold, and a stopped definition is dim. The `+` button opens the creation popup.
+The upper status line shows the windows in the active session and ends with a `+` button for creating a tab on the same target.
 
-The second line shows the windows in the active session and ends with a `+` button for creating a tab on the same target. Left-clicking a workspace opens or selects it. Right-clicking opens its management menu. Closing a session and deleting a definition both require confirmation.
+The lower status line shows saved workspaces and native tmux sessions. The current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens its management menu. Closing a session and deleting a definition both require confirmation.
 
 The creation popup offers `local`, aliases found in `~/.ssh/config`, and a destination entered directly. It then asks for the path and an optional name. The workspace picker selects a workspace, tab, and split in order. Tab and split menus include `< Back`, and each stage previews the selected terminal.
 
@@ -148,5 +142,5 @@ Run the static checks with:
 
 ```sh
 bash -n bin/tmux-atelier tmux-atelier.tmux tests/run
-shellcheck bin/tmux-atelier tmux-atelier.tmux tests/run tests/fixtures/tmux tests/fixtures/ssh tests/fixtures/tmux-log
+shellcheck bin/tmux-atelier tmux-atelier.tmux tests/run tests/fixtures/fzf tests/fixtures/ssh tests/fixtures/tmux tests/fixtures/tmux-log tests/fixtures/tmux-picker
 ```
