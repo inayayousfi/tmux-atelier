@@ -23,7 +23,7 @@ Reload the configuration or restart the tmux server. tmux-atelier sets `Ctrl-a` 
 A target uses the format `destination:path`:
 
 ```text
-local:/home/iy/Projets/tmux-atelier
+local:/home/user/Projects/tmux-atelier
 app01:/srv/app
 deploy@app01:/srv/app
 ```
@@ -59,7 +59,7 @@ A definition and its live session are separate. `close` stops the session but ke
 Create and open a local workspace:
 
 ```sh
-bin/tmux-atelier new local:/home/iy/Projets/demo demo
+bin/tmux-atelier new local:/home/user/Projects/demo demo
 ```
 
 Create and open a remote workspace:
