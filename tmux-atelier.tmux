@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLI="$ROOT/bin/tmux-atelier"
+PLUGIN="$ROOT/tmux-atelier.tmux"
 
 quote_sh() {
     local value=${1//\'/\'\\\'\'}
@@ -11,10 +12,12 @@ quote_sh() {
 }
 
 QCLI=$(quote_sh "$CLI")
+QPLUGIN=$(quote_sh "$PLUGIN")
 TABS_FORMAT='#[align=left,fg=default,bg=default]#{W:#[range=window|#{window_index}] #I #W #[norange default] ,#[range=window|#{window_index} reverse] #I #W #[norange default] }#[range=user|new-tab,bold] + #[default,norange]'
-CLICK_COMMAND=$(quote_sh "exec $QCLI status-click \"#{mouse_status_range}\" \"#{client_name}\" \"#{session_name}\"")
-MENU_COMMAND=$(quote_sh "exec $QCLI status-menu \"#{mouse_status_range}\" \"#{client_name}\"")
-REFRESH_COMMAND=$(quote_sh "$QCLI refresh-status")
+CLICK_COMMAND="run-shell -b \"exec $QCLI status-click \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\" \\\"#{session_name}\\\"\""
+MENU_COMMAND="run-shell -b \"exec $QCLI status-menu \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\"\""
+REFRESH_COMMAND="run-shell -b \"$QCLI refresh-status\""
+TAB_MENU="display-popup -t = -e 'TMUX_ATELIER_CLIENT=#{client_name}' -E -w '45%' -h '30%' \"exec $QCLI popup-tab-menu \\\"#{window_id}\\\"\""
 
 tmux set-option -gq @atelier_root "$ROOT"
 tmux set-option -gq @atelier_cli "$CLI"
@@ -34,6 +37,7 @@ tmux bind-key a display-popup -c '#{client_name}' -e 'TMUX_ATELIER_CLIENT=#{clie
     -E -w '70%' -h '60%' "$QCLI picker"
 tmux bind-key n display-popup -E -w '70%' -h '60%' "$QCLI popup-new"
 tmux bind-key t run-shell -b "exec $QCLI window \"#{session_name}\""
+tmux bind-key r run-shell "$QPLUGIN"
 tmux unbind-key + 2>/dev/null || true
 tmux bind-key = run-shell -b "exec $QCLI split vertical \"#{pane_id}\""
 tmux bind-key - run-shell -b "exec $QCLI split horizontal \"#{pane_id}\""
@@ -44,13 +48,13 @@ tmux bind-key -r l select-pane -R
 
 tmux bind-key -n MouseDown1Status if-shell -F '#{==:#{mouse_status_range},window}' \
     'select-window -t =' \
-    "run-shell -b $CLICK_COMMAND"
+    "$CLICK_COMMAND"
 tmux bind-key -n MouseDown3Status if-shell -F '#{m:a*,#{mouse_status_range}}' \
-    "run-shell -b $MENU_COMMAND" \
-    'display-message "No workspace menu here"'
+    "$MENU_COMMAND" \
+    "$TAB_MENU"
 
 for hook in session-created session-closed session-renamed client-session-changed; do
-    tmux set-hook -g "${hook}[90]" "run-shell -b $REFRESH_COMMAND"
+    tmux set-hook -g "${hook}[90]" "$REFRESH_COMMAND"
 done
 
 "$CLI" refresh-status

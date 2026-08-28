@@ -5,6 +5,7 @@ set -euo pipefail
 readonly TMUX_BIN="${TMUX_ATELIER_TMUX:-tmux}"
 readonly STATE_ROOT="${TMUX_ATELIER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-atelier}"
 readonly WORKSPACES_DIR="$STATE_ROOT/workspaces"
+readonly DEBUG_LOG="${TMUX_ATELIER_DEBUG_LOG:-$STATE_ROOT/debug.log}"
 
 WORKSPACE_NAME=
 WORKSPACE_DESTINATION=
@@ -14,6 +15,16 @@ declare -A SSH_CONFIG_SEEN=()
 die() {
     printf 'tmux-atelier: %s\n' "$*" >&2
     exit 1
+}
+
+debug_log() {
+    local message=$1
+    mkdir -p "$STATE_ROOT"
+    chmod 700 "$STATE_ROOT"
+    touch "$DEBUG_LOG"
+    chmod 600 "$DEBUG_LOG"
+    printf '%(%Y-%m-%dT%H:%M:%S%z)T pid=%s pane=%q client=%q %s\n' \
+        -1 "$$" "${TMUX_PANE:-}" "${TMUX_ATELIER_CLIENT:-}" "$message" >> "$DEBUG_LOG"
 }
 
 tmux_cmd() {
@@ -408,6 +419,7 @@ command_show_new_popup() {
 command_status_menu() {
     local token=${1:-} client=${2:-} name
     name=$(range_name "$token")
+    debug_log "status-menu token=$token resolved=$name requested_client=$client"
     [[ -n $name ]] || return 0
     command_menu "$name" "$client"
 }
@@ -420,26 +432,118 @@ cli_path() {
 }
 
 command_menu() {
-    local name=${1:-} client=${2:-} cli qcli qname
-    local open rename edit close delete
+    local name=${1:-} client=${2:-} cli qcli qname command
     [[ -n $name ]] || die 'usage: tmux-atelier menu name'
+    validate_name "$name"
     cli=$(cli_path)
     qcli=$(quote_sh "$cli")
     qname=$(quote_sh "$name")
-    open=$(quote_sh "$qcli open $qname")
-    rename=$(quote_sh "$qcli popup-rename $qname")
-    edit=$(quote_sh "$qcli popup-edit $qname")
-    close=$(quote_sh "$qcli request-close $qname")
-    delete=$(quote_sh "$qcli request-delete $qname")
-    local -a menu_args=(display-menu)
-    [[ -n $client ]] && menu_args+=(-c "$client")
-    tmux_cmd "${menu_args[@]}" -T " $name " \
-        'Open' o "run-shell -b $open" \
-        'Rename' r "display-popup -E -w 60% -h 30% $rename" \
-        'Edit target' e "display-popup -E -w 70% -h 35% $edit" \
-        '' \
-        'Close session' x "run-shell -b $close" \
-        'Delete definition' d "run-shell -b $delete"
+    command="$qcli popup-workspace-menu $qname"
+    local -a popup_args=(display-popup)
+    [[ -n $client ]] && popup_args+=(-c "$client" -e "TMUX_ATELIER_CLIENT=$client")
+    debug_log "workspace-menu opening name=$name target_client=$client"
+    tmux_cmd "${popup_args[@]}" -E -w '45%' -h '35%' "$command"
+    debug_log "workspace-menu closed name=$name target_client=$client status=0"
+}
+
+choose_action() {
+    local prompt=$1
+    fzf --prompt="$prompt > " --height=100% --border --no-info
+}
+
+command_popup_workspace_menu() {
+    local name=${1:-} file action client=${TMUX_ATELIER_CLIENT:-}
+    validate_name "$name"
+    file=$(workspace_file "$name")
+    debug_log "workspace-fzf started name=$name inherited_client=$client"
+    if ! action=$({
+        printf 'Open workspace\nRename workspace\n'
+        [[ -f $file ]] && ! session_exists "$name" && printf 'Edit target\n'
+        session_exists "$name" && printf 'Close workspace\n'
+        [[ -f $file ]] && printf 'Delete saved workspace\n'
+        true
+    } | choose_action "$name"); then
+        debug_log "workspace-fzf cancelled name=$name inherited_client=$client"
+        return 0
+    fi
+    debug_log "workspace-fzf selected name=$name action=$action inherited_client=$client"
+
+    case $action in
+        'Open workspace') command_open "$name" ;;
+        'Rename workspace') command_defer_request request-rename "$name" "$client" ;;
+        'Edit target') command_popup_edit "$name" ;;
+        'Close workspace') command_defer_request request-close "$name" "$client" ;;
+        'Delete saved workspace') command_defer_request request-delete "$name" "$client" ;;
+    esac
+}
+
+command_popup_tab_menu() {
+    local window=${1:-} name action client=${TMUX_ATELIER_CLIENT:-}
+    [[ $window =~ ^@[0-9]+$ ]] || die "invalid tmux window id: $window"
+    name=$(tmux_cmd display-message -p -t "$window" '#{window_name}')
+    debug_log "tab-fzf started window=$window name=$name inherited_client=$client"
+    if ! action=$(printf 'Rename tab\nClose tab\n' | choose_action "$name"); then
+        debug_log "tab-fzf cancelled window=$window inherited_client=$client"
+        return 0
+    fi
+    debug_log "tab-fzf selected window=$window action=$action inherited_client=$client"
+
+    case $action in
+        'Rename tab')
+            command_defer_request request-tab-rename "$window" "$client"
+            ;;
+        'Close tab')
+            command_defer_request request-tab-close "$window" "$client"
+            ;;
+    esac
+}
+
+command_defer_request() {
+    local request=$1 target=$2 client=${3:-} cli qcli qlog command
+    cli=$(cli_path); qcli=$(quote_sh "$cli")
+    qlog=$(quote_sh "$DEBUG_LOG")
+    command="$qcli $request $(quote_sh "$target")"
+    [[ -z $client ]] || command+=" $(quote_sh "$client")"
+    command+=" >>$qlog 2>&1"
+    debug_log "defer scheduling request=$request target=$target target_client=$client"
+    tmux_cmd run-shell -b -d 0.1 "$command"
+    debug_log "defer scheduled request=$request target=$target target_client=$client status=0"
+}
+
+command_request_tab_rename() {
+    local window=${1:-} client=${2:-} cli qcli command
+    [[ $window =~ ^@[0-9]+$ ]] || die "invalid tmux window id: $window"
+    cli=$(cli_path); qcli=$(quote_sh "$cli")
+    command="$qcli popup-tab-rename $(quote_sh "$window")"
+    local -a popup_args=(display-popup)
+    [[ -z $client ]] || popup_args+=(-c "$client")
+    debug_log "tab-rename-popup opening window=$window target_client=$client"
+    tmux_cmd "${popup_args[@]}" -E -w '50%' -h '20%' "$command"
+    debug_log "tab-rename-popup closed window=$window target_client=$client status=0"
+}
+
+command_popup_tab_rename() {
+    local window=${1:-} name new
+    [[ $window =~ ^@[0-9]+$ ]] || die "invalid tmux window id: $window"
+    name=$(tmux_cmd display-message -p -t "$window" '#{window_name}')
+    debug_log "tab-rename-input started window=$window current_name=$name"
+    if ! read -r -e -p 'New tab name: ' -i "$name" new; then
+        debug_log "tab-rename-input cancelled window=$window"
+        return 0
+    fi
+    debug_log "tab-rename-input submitted window=$window length=${#new}"
+    validate_value 'tab name' "$new"
+    tmux_cmd rename-window -t "$window" "$new"
+    debug_log "tab-rename-input completed window=$window"
+}
+
+command_request_tab_close() {
+    local window=${1:-} client=${2:-} name
+    [[ $window =~ ^@[0-9]+$ ]] || die "invalid tmux window id: $window"
+    name=$(tmux_cmd display-message -p -t "$window" '#{window_name}')
+    local -a confirm_args=(confirm-before)
+    [[ -z $client ]] || confirm_args+=(-t "$client")
+    tmux_cmd "${confirm_args[@]}" -p "Close tab $name? (y/n)" "kill-window -t $window"
 }
 
 command_close() {
@@ -459,19 +563,35 @@ command_delete() {
 }
 
 command_request_close() {
-    local name=${1:-} cli qcli qname command
+    local name=${1:-} client=${2:-} cli qcli qname command
     validate_name "$name"
     cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
-    command=$(quote_sh "$qcli close $qname")
-    tmux_cmd confirm-before -p "Close session $name? (y/n)" "run-shell -b $command"
+    command="run-shell -b \"$qcli close $qname\""
+    local -a confirm_args=(confirm-before)
+    [[ -z $client ]] || confirm_args+=(-t "$client")
+    tmux_cmd "${confirm_args[@]}" -p "Close session $name? (y/n)" "$command"
+}
+
+command_request_rename() {
+    local name=${1:-} client=${2:-} cli qcli qname command
+    validate_name "$name"
+    cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
+    command="$qcli popup-rename $qname"
+    local -a popup_args=(display-popup)
+    [[ -z $client ]] || popup_args+=(-c "$client")
+    debug_log "workspace-rename-popup opening name=$name target_client=$client"
+    tmux_cmd "${popup_args[@]}" -E -w '50%' -h '20%' "$command"
+    debug_log "workspace-rename-popup closed name=$name target_client=$client status=0"
 }
 
 command_request_delete() {
-    local name=${1:-} cli qcli qname command
+    local name=${1:-} client=${2:-} cli qcli qname command
     validate_name "$name"
     cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
-    command=$(quote_sh "$qcli delete $qname")
-    tmux_cmd confirm-before -p "Delete definition $name? (y/n)" "run-shell -b $command"
+    command="run-shell -b \"$qcli delete $qname\""
+    local -a confirm_args=(confirm-before)
+    [[ -z $client ]] || confirm_args+=(-t "$client")
+    tmux_cmd "${confirm_args[@]}" -p "Delete definition $name? (y/n)" "$command"
 }
 
 command_rename() {
@@ -656,8 +776,14 @@ command_picker() {
 command_popup_rename() {
     local old=${1:-} new
     validate_name "$old"
-    read -r -e -p 'New name: ' -i "$old" new || return 0
+    debug_log "workspace-rename-input started name=$old"
+    if ! read -r -e -p 'New workspace name: ' -i "$old" new; then
+        debug_log "workspace-rename-input cancelled name=$old"
+        return 0
+    fi
+    debug_log "workspace-rename-input submitted name=$old length=${#new}"
     command_rename "$old" "$new"
+    debug_log "workspace-rename-input completed old=$old new=$new"
 }
 
 command_popup_edit() {
@@ -685,6 +811,8 @@ Commands:
   picker
   preview-pane [PANE]
   popup-new
+  popup-workspace-menu NAME
+  popup-tab-menu WINDOW_ID
   refresh-status
 EOF
 }
@@ -705,14 +833,22 @@ main() {
         picker) (($# <= 1)) || die 'usage: tmux-atelier picker [client]'; command_picker "$@" ;;
         preview-pane) (($# <= 1)) || die 'usage: tmux-atelier preview-pane [pane]'; command_preview_pane "$@" ;;
         popup-new) (($# == 0)) || die 'usage: tmux-atelier popup-new'; command_popup_new ;;
+        popup-workspace-menu) (($# == 1)) || die 'usage: tmux-atelier popup-workspace-menu name'; command_popup_workspace_menu "$@" ;;
+        popup-tab-menu) (($# == 1)) || die 'usage: tmux-atelier popup-tab-menu window-id'; command_popup_tab_menu "$@" ;;
+        popup-tab-rename) (($# == 1)) || die 'usage: tmux-atelier popup-tab-rename window-id'; command_popup_tab_rename "$@" ;;
         popup-rename) (($# == 1)) || die 'usage: tmux-atelier popup-rename name'; command_popup_rename "$@" ;;
         popup-edit) (($# == 1)) || die 'usage: tmux-atelier popup-edit name'; command_popup_edit "$@" ;;
         refresh-status) (($# == 0)) || die 'usage: tmux-atelier refresh-status'; command_refresh_status ;;
         status-click) ((1 <= $# && $# <= 3)) || die 'usage: tmux-atelier status-click range [client] [session]'; command_status_click "$@" ;;
         status-menu) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier status-menu range [client]'; command_status_menu "$@" ;;
         menu) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier menu name [client]'; command_menu "$@" ;;
-        request-close) (($# == 1)) || die 'usage: tmux-atelier request-close name'; command_request_close "$@" ;;
-        request-delete) (($# == 1)) || die 'usage: tmux-atelier request-delete name'; command_request_delete "$@" ;;
+        request-close) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-close name [client]'; command_request_close "$@" ;;
+        request-rename) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-rename name [client]'; command_request_rename "$@" ;;
+        request-tab-rename) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-tab-rename window-id [client]'; command_request_tab_rename "$@" ;;
+        request-tab-close) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-tab-close window-id [client]'; command_request_tab_close "$@" ;;
+        request-delete) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-delete name [client]'; command_request_delete "$@" ;;
+        debug-path) (($# == 0)) || die 'usage: tmux-atelier debug-path'; printf '%s\n' "$DEBUG_LOG" ;;
+        debug-clear) (($# == 0)) || die 'usage: tmux-atelier debug-clear'; mkdir -p "$STATE_ROOT"; : > "$DEBUG_LOG"; chmod 600 "$DEBUG_LOG" ;;
         help|-h|--help) (($# == 0)) || die 'usage: tmux-atelier help'; usage ;;
         *) die "unknown command: $command" ;;
     esac

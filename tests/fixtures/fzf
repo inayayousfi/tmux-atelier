@@ -7,4 +7,9 @@ mapfile -t choices
 if [[ -n ${TMUX_ATELIER_FZF_INPUT_LOG:-} ]]; then
     printf '%s\n' "${choices[@]}" >> "$TMUX_ATELIER_FZF_INPUT_LOG"
 fi
+[[ ${TMUX_ATELIER_FZF_CANCEL:-0} != 1 ]] || exit 1
+if [[ -n ${TMUX_ATELIER_FZF_CHOICE:-} ]]; then
+    printf '%s\n' "$TMUX_ATELIER_FZF_CHOICE"
+    exit 0
+fi
 printf '%s\n' "${choices[0]}"

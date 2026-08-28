@@ -218,10 +218,16 @@ assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefi
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +l ')" 'select-pane -R' 'vim l selects the pane on the right'
 "$TMUX" list-keys -T prefix | grep -F 'popup-new' >/dev/null || fail 'workspace creation popup is bound'
 pass 'workspace creation popup is bound'
+RELOAD_BINDING=$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +r ')
+assert_contains "$RELOAD_BINDING" 'tmux-atelier.tmux' 'HERDR r reloads tmux-atelier'
 "$TMUX" list-keys -T root | grep -F 'MouseDown1Status' >/dev/null || fail 'left status click is bound'
 pass 'left status click is bound'
 "$TMUX" list-keys -T root | grep -F 'status-menu' >/dev/null || fail 'right workspace click is bound'
 pass 'right workspace click is bound'
+RIGHT_CLICK_BINDING=$("$TMUX" list-keys -T root | grep -F 'MouseDown3Status ')
+assert_contains "$RIGHT_CLICK_BINDING" 'display-popup' 'right tab click opens a popup'
+assert_contains "$RIGHT_CLICK_BINDING" 'popup-tab-menu' 'right tab click opens the FZF action menu'
+assert_contains "$RIGHT_CLICK_BINDING" '#{window_id}' 'tab menu receives the clicked window id'
 "$TMUX" show-hooks -g session-created | grep -F 'refresh-status' >/dev/null || fail 'session hook refreshes status'
 pass 'session hook refreshes status'
 "$TMUX" new-session -d -s native-after-plugin 'sleep 120'
@@ -240,6 +246,15 @@ mapfile -d '' -t POPUP_ARGS < "$COMMAND_LOG"
 assert_equal display-popup "${POPUP_ARGS[0]}" 'status plus opens a tmux popup'
 assert_equal test-client "${POPUP_ARGS[2]}" 'status plus targets the client that clicked'
 assert_contains "${POPUP_ARGS[8]}" 'popup-new' 'status plus runs the creation form inside the popup'
+
+: > "$COMMAND_LOG"
+TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
+    "$CLI" menu workspace test-client
+mapfile -d '' -t WORKSPACE_MENU_ARGS < "$COMMAND_LOG"
+assert_equal display-popup "${WORKSPACE_MENU_ARGS[0]}" 'right workspace click opens a popup'
+assert_contains "${WORKSPACE_MENU_ARGS[*]}" 'popup-workspace-menu' 'workspace popup runs the FZF action menu'
 
 WINDOWS_BEFORE=$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)
 "$CLI" status-click new-tab '' remote
@@ -269,6 +284,68 @@ assert_equal '=workspace:2' "${PICKER_ARGS[7]}" 'picker opens the chosen workspa
 PREVIEW=$(TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
     TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" "$CLI" preview-pane '%7')
 assert_equal 'terminal preview' "$PREVIEW" 'picker preview captures the selected terminal'
+
+MENU_FZF_LOG="$TEST_ROOT/menu-fzf.log"
+MENU_INPUT_LOG="$TEST_ROOT/menu-input.log"
+TMUX_ATELIER_STATE_DIR="$TEST_ROOT/picker-state" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
+TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_FZF_LOG="$MENU_FZF_LOG" \
+TMUX_ATELIER_FZF_INPUT_LOG="$MENU_INPUT_LOG" \
+TMUX_ATELIER_FZF_CANCEL=1 \
+PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-workspace-menu workspace
+assert_contains "$(< "$MENU_FZF_LOG")" 'workspace > ' 'workspace actions use FZF'
+assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename workspace' 'workspace FZF menu offers rename'
+assert_contains "$(< "$MENU_INPUT_LOG")" 'Close workspace' 'workspace FZF menu offers close'
+
+: > "$COMMAND_LOG"
+TMUX_ATELIER_STATE_DIR="$TEST_ROOT/picker-state" \
+TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
+TMUX_ATELIER_FZF_LOG="$MENU_FZF_LOG" \
+TMUX_ATELIER_FZF_CHOICE='Rename workspace' \
+PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-workspace-menu native-session
+mapfile -d '' -t DEFERRED_RENAME_ARGS < "$COMMAND_LOG"
+assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'run-shell' 'native workspace rename is not mistaken for FZF cancellation'
+assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'request-rename' 'native workspace rename schedules its input popup'
+
+: > "$COMMAND_LOG"
+TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
+    "$CLI" request-rename workspace test-client
+mapfile -d '' -t RENAME_PROMPT_ARGS < "$COMMAND_LOG"
+assert_equal display-popup "${RENAME_PROMPT_ARGS[0]}" 'workspace rename opens a dedicated input popup'
+assert_contains "${RENAME_PROMPT_ARGS[*]}" 'popup-rename' 'workspace rename popup runs the text input form'
+assert_contains "${RENAME_PROMPT_ARGS[*]}" 'test-client' 'workspace rename popup targets the originating client'
+
+: > "$COMMAND_LOG"
+TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
+    "$CLI" request-tab-rename '@2' test-client
+mapfile -d '' -t TAB_RENAME_PROMPT_ARGS < "$COMMAND_LOG"
+assert_contains "${TAB_RENAME_PROMPT_ARGS[*]}" 'display-popup' 'tab rename opens a dedicated input popup'
+assert_contains "${TAB_RENAME_PROMPT_ARGS[*]}" 'popup-tab-rename' 'tab rename popup runs the text input form'
+assert_contains "${TAB_RENAME_PROMPT_ARGS[*]}" 'test-client' 'tab rename popup targets the originating client'
+
+: > "$MENU_FZF_LOG"
+: > "$MENU_INPUT_LOG"
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
+TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_FZF_LOG="$MENU_FZF_LOG" \
+TMUX_ATELIER_FZF_INPUT_LOG="$MENU_INPUT_LOG" \
+TMUX_ATELIER_FZF_CANCEL=1 \
+PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-tab-menu '@2'
+assert_contains "$(< "$MENU_FZF_LOG")" '%1 > ' 'tab actions use FZF'
+assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename tab' 'tab FZF menu offers rename'
+assert_contains "$(< "$MENU_INPUT_LOG")" 'Close tab' 'tab FZF menu offers close'
 
 "$TMUX" new-window -d -t '=remote:' 'sleep 120'
 assert_equal "$((WINDOWS_AFTER + 1))" "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
