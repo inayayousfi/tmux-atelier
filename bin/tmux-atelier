@@ -372,8 +372,15 @@ range_name() {
 }
 
 command_status_click() {
-    local token=${1:-} client=${2:-} name
+    local token=${1:-} client=${2:-} session=${3:-} name
     [[ $token == new ]] && { command_show_new_popup "$client"; return; }
+    if [[ $token == new-tab ]]; then
+        if [[ -z $session && -n $client ]]; then
+            session=$(tmux_cmd display-message -p -c "$client" '#{session_name}')
+        fi
+        command_window "$session"
+        return
+    fi
     name=$(range_name "$token")
     [[ -n $name ]] || return 0
     if session_exists "$name"; then
@@ -572,10 +579,78 @@ command_popup_new() {
     fi
 }
 
+workspace_choices() {
+    local name pane
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        pane=
+        if session_exists "$name"; then
+            pane=$(tmux_cmd display-message -p -t "=$name:" '#{pane_id}')
+        fi
+        printf '%s\t%s\n' "$name" "$pane"
+    done < <(all_names)
+}
+
+command_preview_pane() {
+    local pane=${1:-}
+    if [[ -z $pane ]]; then
+        printf 'No live terminal for this selection.\n'
+        return
+    fi
+    tmux_cmd capture-pane -p -S -200 -t "$pane" 2>/dev/null ||
+        printf 'The selected terminal is no longer available.\n'
+}
+
 command_picker() {
-    local name
-    name=$(all_names | fzf --prompt='Workspace > ' --height=100% --border) || return 0
-    [[ -n $name ]] && command_open "$name"
+    local client=${1:-${TMUX_ATELIER_CLIENT:-}} cli qcli preview name_choice name
+    local window_choice window_index pane_choice pane_id
+    cli=$(cli_path)
+    qcli=$(quote_sh "$cli")
+    preview="$qcli preview-pane {2}"
+
+    while true; do
+        name_choice=$(workspace_choices |
+            fzf --delimiter=$'\t' --with-nth=1 --prompt='Workspace > ' \
+                --preview="$preview" --preview-window='right,60%,border-left' \
+                --height=100% --border) || return 0
+        name=${name_choice%%$'\t'*}
+        [[ -n $name ]] || return 0
+        session_exists "$name" || command_open "$name" --detached
+
+        while true; do
+            window_choice=$({
+                tmux_cmd list-windows -t "=$name:" \
+                    -F $'#{window_index}\t#{window_name}\t#{window_panes} panes\t#{pane_id}'
+                printf '< Back\t\t\t\n'
+            } | fzf --delimiter=$'\t' --with-nth=1,2,3 --prompt='Tab > ' \
+                --preview="$qcli preview-pane {4}" --preview-window='right,60%,border-left' \
+                --height=100% --border) || return 0
+            [[ ${window_choice%%$'\t'*} == '< Back' ]] && break
+            window_index=${window_choice%%$'\t'*}
+            [[ -n $window_index ]] || return 0
+
+            while true; do
+                pane_choice=$({
+                    tmux_cmd list-panes -t "=$name:$window_index" \
+                        -F $'#{pane_index}: #{pane_current_command}  #{pane_current_path}\t#{pane_id}'
+                    printf '< Back\t\n'
+                } | fzf --delimiter=$'\t' --with-nth=1 --prompt='Split > ' \
+                    --preview="$preview" --preview-window='right,60%,border-left' \
+                    --height=100% --border) || return 0
+                [[ ${pane_choice%%$'\t'*} == '< Back' ]] && break
+                pane_id=${pane_choice#*$'\t'}
+                [[ -n $pane_id ]] || return 0
+
+                tmux_cmd select-pane -t "$pane_id"
+                if [[ -n $client ]]; then
+                    tmux_cmd switch-client -c "$client" -t "=$name:$window_index"
+                else
+                    tmux_cmd switch-client -t "=$name:$window_index"
+                fi
+                return
+            done
+        done
+    done
 }
 
 command_popup_rename() {
@@ -608,6 +683,7 @@ Commands:
   close NAME
   delete NAME
   picker
+  preview-pane [PANE]
   popup-new
   refresh-status
 EOF
@@ -626,12 +702,13 @@ main() {
         edit) (($# == 2)) || die 'usage: tmux-atelier edit name destination:path'; command_edit "$@" ;;
         close) (($# == 1)) || die 'usage: tmux-atelier close name'; command_close "$@" ;;
         delete) (($# == 1)) || die 'usage: tmux-atelier delete name'; command_delete "$@" ;;
-        picker) (($# == 0)) || die 'usage: tmux-atelier picker'; command_picker ;;
+        picker) (($# <= 1)) || die 'usage: tmux-atelier picker [client]'; command_picker "$@" ;;
+        preview-pane) (($# <= 1)) || die 'usage: tmux-atelier preview-pane [pane]'; command_preview_pane "$@" ;;
         popup-new) (($# == 0)) || die 'usage: tmux-atelier popup-new'; command_popup_new ;;
         popup-rename) (($# == 1)) || die 'usage: tmux-atelier popup-rename name'; command_popup_rename "$@" ;;
         popup-edit) (($# == 1)) || die 'usage: tmux-atelier popup-edit name'; command_popup_edit "$@" ;;
         refresh-status) (($# == 0)) || die 'usage: tmux-atelier refresh-status'; command_refresh_status ;;
-        status-click) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier status-click range [client]'; command_status_click "$@" ;;
+        status-click) ((1 <= $# && $# <= 3)) || die 'usage: tmux-atelier status-click range [client] [session]'; command_status_click "$@" ;;
         status-menu) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier status-menu range [client]'; command_status_menu "$@" ;;
         menu) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier menu name [client]'; command_menu "$@" ;;
         request-close) (($# == 1)) || die 'usage: tmux-atelier request-close name'; command_request_close "$@" ;;

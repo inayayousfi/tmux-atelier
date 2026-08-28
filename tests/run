@@ -11,6 +11,9 @@ LOCAL_ONE="$TEST_ROOT/local one=ok"
 LOCAL_TWO="$TEST_ROOT/local two"
 SSH_LOG="$TEST_ROOT/ssh.log"
 COMMAND_LOG="$TEST_ROOT/tmux-command.log"
+FZF_LOG="$TEST_ROOT/fzf.log"
+FZF_INPUT_LOG="$TEST_ROOT/fzf-input.log"
+PICKER_LOG="$TEST_ROOT/picker.log"
 
 export TMUX_ATELIER_TEST_SOCKET="atelier-test-$$"
 export TMUX_ATELIER_REAL_TMUX
@@ -93,9 +96,13 @@ assert_equal "$LOCAL_ONE" "$("$TMUX" display-message -p -t '=local-one:1' '#{pan
 PANE=$("$TMUX" display-message -p -t '=local-one:1' '#{pane_id}')
 "$CLI" split vertical "$PANE"
 assert_equal 2 "$("$TMUX" list-panes -t '=local-one:1' -F '#{pane_id}' | wc -l)" 'vertical split is created'
+assert_equal 1 "$("$TMUX" list-panes -t '=local-one:1' -F '#{pane_height}' | sort -u | wc -l)" 'vertical split places panes side by side'
 while IFS= read -r path; do
     assert_equal "$LOCAL_ONE" "$path" 'local split inherits path'
 done < <("$TMUX" list-panes -t '=local-one:1' -F '#{pane_current_path}')
+PANE=$("$TMUX" display-message -p -t '=local-one:0' '#{pane_id}')
+"$CLI" split horizontal "$PANE"
+assert_equal 1 "$("$TMUX" list-panes -t '=local-one:0' -F '#{pane_width}' | sort -u | wc -l)" 'horizontal split stacks panes top and bottom'
 
 assert_fails 'live workspace target cannot be edited' "$CLI" edit local-one "local:$LOCAL_TWO"
 "$CLI" close local-one
@@ -179,11 +186,36 @@ assert_equal bottom "$("$TMUX" show-options -gv status-position)" 'status bar is
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'remote@app' 'workspace line includes remote destination'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'project@local' 'stopped workspace remains in status'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=window' 'window line is clickable'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=user|new-tab' 'tab line has a new-tab button'
 WINDOW_LINE=$("$TMUX" display-message -p -t '=remote:' "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')")
 FIRST_WINDOW=$("$TMUX" display-message -p -t '=remote:0' '#{window_index} #{window_name}')
 assert_contains "$WINDOW_LINE" "$FIRST_WINDOW" 'window line renders the first tab'
-"$TMUX" list-keys -T prefix | grep -F 'split vertical' >/dev/null || fail 'HERDR vertical split is bound'
-pass 'HERDR vertical split is bound'
+VERTICAL_BINDING=$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +=')
+assert_contains "$VERTICAL_BINDING" 'split' 'HERDR vertical split invokes tmux-atelier'
+assert_contains "$VERTICAL_BINDING" 'vertical' 'HERDR equals key requests a vertical split'
+sleep 10 | env -u TMUX "$TMUX" -C attach-session -t '=remote' > "$TEST_ROOT/control-client.log" 2>&1 &
+CONTROL_PID=$!
+CONTROL_CLIENT=
+for _ in {1..10}; do
+    CONTROL_CLIENT=$("$TMUX" list-clients -F '#{client_name}' 2>/dev/null || true)
+    [[ -n $CONTROL_CLIENT ]] && break
+    sleep 0.1
+done
+[[ -n $CONTROL_CLIENT ]] || fail "control client starts for key binding test: $(< "$TEST_ROOT/control-client.log")"
+PANES_BEFORE=$("$TMUX" list-panes -a -F '#{pane_id}' | wc -l)
+"$TMUX" send-keys -K -c "$CONTROL_CLIENT" C-a =
+for _ in {1..10}; do
+    PANES_AFTER=$("$TMUX" list-panes -a -F '#{pane_id}' | wc -l)
+    ((PANES_AFTER == PANES_BEFORE + 1)) && break
+    sleep 0.1
+done
+assert_equal "$((PANES_BEFORE + 1))" "$PANES_AFTER" 'HERDR equals binding creates a pane without opening buffers'
+"$TMUX" detach-client -t "$CONTROL_CLIENT"
+wait "$CONTROL_PID" 2>/dev/null || true
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +h ')" 'select-pane -L' 'vim h selects the pane on the left'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +j ')" 'select-pane -D' 'vim j selects the pane below'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +k ')" 'select-pane -U' 'vim k selects the pane above'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +l ')" 'select-pane -R' 'vim l selects the pane on the right'
 "$TMUX" list-keys -T prefix | grep -F 'popup-new' >/dev/null || fail 'workspace creation popup is bound'
 pass 'workspace creation popup is bound'
 "$TMUX" list-keys -T root | grep -F 'MouseDown1Status' >/dev/null || fail 'left status click is bound'
@@ -209,8 +241,37 @@ assert_equal display-popup "${POPUP_ARGS[0]}" 'status plus opens a tmux popup'
 assert_equal test-client "${POPUP_ARGS[2]}" 'status plus targets the client that clicked'
 assert_contains "${POPUP_ARGS[8]}" 'popup-new' 'status plus runs the creation form inside the popup'
 
+WINDOWS_BEFORE=$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)
+"$CLI" status-click new-tab '' remote
+WINDOWS_AFTER=$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)
+assert_equal "$((WINDOWS_BEFORE + 1))" "$WINDOWS_AFTER" 'tab plus creates a window on the current workspace target'
+
+TMUX_ATELIER_STATE_DIR="$TEST_ROOT/picker-state" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_FZF_LOG="$FZF_LOG" \
+TMUX_ATELIER_FZF_INPUT_LOG="$FZF_INPUT_LOG" \
+TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" \
+PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" picker test-client
+assert_equal 3 "$(wc -l < "$FZF_LOG")" 'picker opens workspace, tab, and split menus'
+assert_contains "$(< "$FZF_LOG")" 'Workspace > ' 'picker asks for a workspace first'
+assert_contains "$(< "$FZF_LOG")" 'Tab > ' 'picker asks for a tab second'
+assert_contains "$(< "$FZF_LOG")" 'Split > ' 'picker asks for a split last'
+assert_contains "$(< "$FZF_LOG")" 'preview-pane' 'picker configures terminal previews'
+assert_contains "$(< "$FZF_INPUT_LOG")" '< Back' 'tab and split menus offer a back selection'
+mapfile -d '' -t PICKER_ARGS < "$PICKER_LOG"
+assert_equal select-pane "${PICKER_ARGS[0]}" 'picker selects the chosen pane'
+assert_equal '%7' "${PICKER_ARGS[2]}" 'picker keeps the chosen pane id'
+assert_equal switch-client "${PICKER_ARGS[3]}" 'picker switches the originating client'
+assert_equal test-client "${PICKER_ARGS[5]}" 'picker targets the client that opened it'
+assert_equal '=workspace:2' "${PICKER_ARGS[7]}" 'picker opens the chosen workspace tab'
+PREVIEW=$(TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
+    TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" "$CLI" preview-pane '%7')
+assert_equal 'terminal preview' "$PREVIEW" 'picker preview captures the selected terminal'
+
 "$TMUX" new-window -d -t '=remote:' 'sleep 120'
-assert_equal 3 "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
+assert_equal "$((WINDOWS_AFTER + 1))" "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
 "$TMUX" display-message -p -t '=remote:' '#{session_name}' >/dev/null || fail 'existing session remains inspectable without invoking scripts'
 pass 'existing session remains inspectable without invoking scripts'
 

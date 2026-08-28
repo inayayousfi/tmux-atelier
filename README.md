@@ -95,9 +95,9 @@ A target cannot be edited while its session is alive. Close the session before r
 
 The first status line shows saved workspaces and native tmux sessions. The current workspace uses reverse video, a live session is bold, and a stopped definition is dim. The `+` button opens the creation popup.
 
-The second line shows the windows in the active session. Left-clicking a workspace opens or selects it. Right-clicking opens its management menu. Closing a session and deleting a definition both require confirmation.
+The second line shows the windows in the active session and ends with a `+` button for creating a tab on the same target. Left-clicking a workspace opens or selects it. Right-clicking opens its management menu. Closing a session and deleting a definition both require confirmation.
 
-The creation popup offers `local`, aliases found in `~/.ssh/config`, and a destination entered directly. It then asks for the path and an optional name.
+The creation popup offers `local`, aliases found in `~/.ssh/config`, and a destination entered directly. It then asks for the path and an optional name. The workspace picker selects a workspace, tab, and split in order. Tab and split menus include `< Back`, and each stage previews the selected terminal.
 
 The key bindings follow HERDR:
 
@@ -105,8 +105,12 @@ The key bindings follow HERDR:
 Ctrl-a a    choose a workspace
 Ctrl-a n    create a workspace
 Ctrl-a t    create a tab on the same target
-Ctrl-a +    create a vertical split on the same target
+Ctrl-a =    create a vertical split on the same target
 Ctrl-a -    create a horizontal split on the same target
+Ctrl-a h    select the pane on the left
+Ctrl-a j    select the pane below
+Ctrl-a k    select the pane above
+Ctrl-a l    select the pane on the right
 ```
 
 Tab and split commands read their target from tmux session options. A session created without tmux-atelier keeps native tmux behavior.

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+: "${TMUX_ATELIER_FZF_LOG:?}"
+printf '%s\n' "$*" >> "$TMUX_ATELIER_FZF_LOG"
+mapfile -t choices
+if [[ -n ${TMUX_ATELIER_FZF_INPUT_LOG:-} ]]; then
+    printf '%s\n' "${choices[@]}" >> "$TMUX_ATELIER_FZF_INPUT_LOG"
+fi
+printf '%s\n' "${choices[0]}"

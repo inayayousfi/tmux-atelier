@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+: "${TMUX_ATELIER_PICKER_LOG:?}"
+
+case ${1:-} in
+    show-options)
+        printf '%s\n' "${TMUX_ATELIER_CLI_FOR_TEST:?}"
+        ;;
+    has-session)
+        exit 0
+        ;;
+    list-sessions)
+        printf 'workspace\n'
+        ;;
+    display-message)
+        printf '%%1\n'
+        ;;
+    list-windows)
+        printf '2\teditor\t2 panes\t%%7\n'
+        ;;
+    list-panes)
+        printf '1: zsh  /work\t%%7\n'
+        ;;
+    capture-pane)
+        printf 'terminal preview\n'
+        ;;
+    select-pane|switch-client)
+        printf '%s\0' "$@" >> "$TMUX_ATELIER_PICKER_LOG"
+        ;;
+    *)
+        printf 'unexpected tmux command: %s\n' "$*" >&2
+        exit 1
+        ;;
+esac
