@@ -38,6 +38,8 @@ MENU_COMMAND="run-shell -b \"exec $QCLI status-menu \\\"#{mouse_status_range}\\\
 REFRESH_COMMAND="run-shell -b \"$QCLI refresh-status\""
 SAVE_COMMAND="run-shell -b \"$QCLI snapshot\""
 RESTORE_COMMAND="run-shell -b \"$QCLI restore-start \\\"#{client_name}\\\"\""
+SESSION_ADOPT_COMMAND="run-shell -b -d 0.1 \"$QCLI adopt-session \\\"#{session_name}\\\"\""
+CLIENT_ADOPT_COMMAND="run-shell -b \"$QCLI adopt-session \\\"#{session_name}\\\" \\\"#{client_name}\\\"\""
 TAB_MENU="display-popup -t = -e 'TMUX_ATELIER_CLIENT=#{client_name}' -E -w '45%' -h '30%' \"exec $QCLI popup-tab-menu \\\"#{window_id}\\\"\""
 
 tmux set-option -gq @atelier_root "$ROOT"
@@ -49,7 +51,8 @@ tmux set-option -g status-interval 5
 tmux set-option -g 'status-format[0]' "$TABS_FORMAT"
 tmux set-option -g 'status-format[1]' "#[range=user|new,$ADD_STYLE] + #[default,norange]"
 
-tmux bind-key -n MouseDown1Status if-shell -F '#{==:#{mouse_status_range},window}' \
+tmux unbind-key -n MouseDown1Status
+tmux bind-key -n MouseUp1Status if-shell -F '#{==:#{mouse_status_range},window}' \
     'select-window -t =' \
     "$CLICK_COMMAND"
 tmux bind-key -n MouseDown3Status if-shell -F '#{m:a*,#{mouse_status_range}}' \
@@ -91,5 +94,7 @@ for hook in after-new-window after-split-window after-kill-pane after-select-lay
     tmux set-hook -g "${hook}[91]" "$SAVE_COMMAND"
 done
 tmux set-hook -g 'client-attached[90]' "$RESTORE_COMMAND"
+tmux set-hook -g 'session-created[91]' "$SESSION_ADOPT_COMMAND"
+tmux set-hook -g 'client-attached[91]' "$CLIENT_ADOPT_COMMAND"
 
 "$CLI" refresh-status

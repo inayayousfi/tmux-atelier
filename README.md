@@ -61,6 +61,8 @@ The `created` value keeps workspaces in creation order. Older definitions withou
 
 A definition and its live session are separate. `close` stops the session but keeps its definition. `delete` removes the definition but leaves a live session alone.
 
+Every new native tmux session is adopted as a local workspace. tmux-atelier reads the first pane's canonical working directory, reuses a saved workspace that already points there, or creates a new definition whose name comes from the directory name. If the matching workspace is already running, the temporary session is removed and its client switches to the existing workspace.
+
 ## Usage
 
 Create and open a local workspace:
@@ -117,7 +119,7 @@ $    rename the current workspace and its saved definition
 
 Custom keys already assigned to these native actions are reused in the same way. The plugin does not change the prefix or navigation keys. Commands without a tmux-atelier equivalent, including the native chooser on `w`, retain their normal tmux behavior.
 
-Tab and split commands read their target from tmux session options. A session created without tmux-atelier keeps native tmux behavior.
+Tab and split commands read their target from tmux session options. Sessions that existed before the plugin was loaded keep native tmux behavior until they are attached again and adopted.
 
 ## Session Restoration
 

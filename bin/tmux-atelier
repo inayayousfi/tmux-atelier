@@ -8,6 +8,7 @@ readonly WORKSPACES_DIR="$STATE_ROOT/workspaces"
 readonly DEBUG_LOG="${TMUX_ATELIER_DEBUG_LOG:-$STATE_ROOT/debug.log}"
 readonly RESTORE_FILE="$STATE_ROOT/restore.snapshot"
 readonly SNAPSHOT_LOCK="$STATE_ROOT/.snapshot.lock"
+readonly ADOPTION_LOCK="$STATE_ROOT/.adoption.lock"
 
 WORKSPACE_NAME=
 WORKSPACE_DESTINATION=
@@ -147,7 +148,7 @@ parse_target() {
 }
 
 normalise_name() {
-    local path=$1 candidate base suffix=2
+    local path=$1 excluded_session=${2:-} candidate base suffix=2
     base=${path%/}
     base=${base##*/}
     [[ -n $base && $base != '.' && $base != '~' ]] || base=workspace
@@ -156,7 +157,8 @@ normalise_name() {
     candidate=${candidate%-}
     [[ -n $candidate ]] || candidate=workspace
     base=$candidate
-    while [[ -e $WORKSPACES_DIR/$candidate ]] || session_exists "$candidate"; do
+    while [[ -e $WORKSPACES_DIR/$candidate ]] ||
+        { [[ $candidate != "$excluded_session" ]] && session_exists "$candidate"; }; do
         candidate="$base-$suffix"
         ((suffix++))
     done
@@ -232,6 +234,93 @@ create_session() {
         tmux_cmd kill-session -t "=$name" 2>/dev/null || true
         return 1
     fi
+}
+
+workspace_for_local_path() {
+    local wanted=$1 name candidate
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        read_workspace "$name"
+        [[ $WORKSPACE_DESTINATION == local ]] || continue
+        candidate=$(canonical_local_path "$WORKSPACE_PATH" 2>/dev/null || true)
+        [[ $candidate == "$wanted" ]] && { printf '%s\n' "$name"; return; }
+    done < <(definition_names)
+    return 0
+}
+
+client_for_session() {
+    local wanted=$1 client session
+    while IFS=$'\t' read -r session client; do
+        [[ $session == "$wanted" ]] && { printf '%s\n' "$client"; return; }
+    done < <(tmux_cmd list-clients -F $'#{session_name}\t#{client_name}' 2>/dev/null || true)
+    return 0
+}
+
+adopt_session() {
+    local session=${1:-} client=${2:-} pending path existing name old
+    [[ -n $session ]] || return 0
+    session_exists "$session" || return 0
+    [[ $(session_option "$session" @atelier_managed) != 1 ]] || return 0
+    pending=$(tmux_cmd show-options -gqv @atelier_restore_pending 2>/dev/null || true)
+    [[ $pending != 1 ]] || { debug_log "session adoption deferred session=$session restore=pending"; return; }
+    path=$(tmux_cmd display-message -p -t "=$session:" '#{pane_current_path}')
+    path=$(canonical_local_path "$path") || {
+        debug_log "session adoption skipped session=$session reason=invalid-cwd"
+        return 0
+    }
+    if [[ -z $client ]]; then
+        client=$(client_for_session "$session")
+    fi
+    existing=$(workspace_for_local_path "$path")
+    if [[ -n $existing && $existing != "$session" ]] && session_exists "$existing"; then
+        [[ -z $client ]] || tmux_cmd switch-client -c "$client" -t "=$existing"
+        tmux_cmd kill-session -t "=$session"
+        debug_log "session adoption reused=$existing removed=$session path=$(printf '%q' "$path")"
+        command_snapshot
+        refresh_status_if_running
+        return 0
+    fi
+
+    old=$session
+    if [[ -n $existing ]]; then
+        name=$existing
+    else
+        name=$(normalise_name "$path" "$session")
+        write_workspace "$name" local "$path" create || die "could not save adopted workspace: $name"
+    fi
+    if [[ $session != "$name" ]]; then
+        if ! tmux_cmd rename-session -t "=$session" "$name"; then
+            [[ -n $existing ]] || rm -f "$(workspace_file "$name")"
+            return 1
+        fi
+        session=$name
+    fi
+    if ! mark_session "$session" local "$path"; then
+        [[ $session == "$old" ]] || tmux_cmd rename-session -t "=$session" "$old" 2>/dev/null || true
+        [[ -n $existing ]] || rm -f "$(workspace_file "$name")"
+        return 1
+    fi
+    debug_log "session adopted old=$old workspace=$name path=$(printf '%q' "$path")"
+    command_snapshot
+    refresh_status_if_running
+}
+
+command_adopt_session() {
+    local attempt acquired=0
+    mkdir -p "$STATE_ROOT"
+    chmod 700 "$STATE_ROOT"
+    for ((attempt = 0; attempt < 500; ++attempt)); do
+        if mkdir "$ADOPTION_LOCK" 2>/dev/null; then
+            acquired=1
+            break
+        fi
+        sleep 0.01
+    done
+    ((acquired)) || die 'could not acquire session adoption lock'
+    (
+        trap 'rmdir "$ADOPTION_LOCK"' EXIT
+        adopt_session "$@"
+    )
 }
 
 snapshot_field() {
@@ -502,11 +591,16 @@ restore_snapshot_data() {
 }
 
 command_restore_discard() {
+    local client=${1:-} session
     debug_log 'restore discarded; starting fresh'
     rm -f "$RESTORE_FILE"
     tmux_cmd set-option -gq @atelier_restore_pending 0
     tmux_cmd set-option -gq @atelier_restore_handled 1
     command_snapshot
+    if [[ -n $client ]]; then
+        session=$(tmux_cmd display-message -p -c "$client" '#{session_name}' 2>/dev/null || true)
+        [[ -z $session ]] || command_adopt_session "$session" "$client"
+    fi
 }
 
 rollback_restore() {
@@ -518,14 +612,17 @@ rollback_restore() {
 }
 
 command_restore() {
-    local client=${1:-} metadata active created_file status
+    local client=${1:-} metadata active created_file status bootstrap=''
     [[ -f $RESTORE_FILE ]] || return 0
     if ! metadata=$(validate_snapshot); then
         debug_log 'restore rejected invalid snapshot'
-        command_restore_discard
+        command_restore_discard "$client"
         die 'invalid restore snapshot'
     fi
     IFS=$'\t' read -r active _ <<< "$metadata"
+    if [[ -n $client ]]; then
+        bootstrap=$(tmux_cmd display-message -p -c "$client" '#{session_name}' 2>/dev/null || true)
+    fi
     debug_log "restore started client=$client active=$active"
     created_file=$(mktemp "$STATE_ROOT/.restore-created.XXXXXX") || return 1
     tmux_cmd set-option -gq @atelier_restore_pending 1
@@ -553,6 +650,11 @@ command_restore() {
     if [[ -n $client && -n $active ]] && session_exists "$active"; then
         tmux_cmd switch-client -c "$client" -t "=$active"
     fi
+    if [[ -n $bootstrap && $bootstrap != "$active" ]] && session_exists "$bootstrap" &&
+        [[ $(session_option "$bootstrap" @atelier_managed) != 1 ]]; then
+        tmux_cmd kill-session -t "=$bootstrap"
+        debug_log "restore removed bootstrap session=$bootstrap"
+    fi
     debug_log "restore completed client=$client active=$active"
 }
 
@@ -560,7 +662,7 @@ command_popup_restore() {
     local client=${1:-} metadata workspaces windows panes choice
     metadata=$(validate_snapshot) || die 'invalid restore snapshot'
     IFS=$'\t' read -r _ workspaces windows panes <<< "$metadata"
-    trap 'command_restore_discard >/dev/null 2>&1 || true' EXIT
+    trap 'command_restore_discard "$client" >/dev/null 2>&1 || true' EXIT
     printf 'Restore %s workspaces, %s tabs, and %s panes? [y/N] ' \
         "$workspaces" "$windows" "$panes"
     if read -r -n 1 choice && [[ $choice == y || $choice == Y ]]; then
@@ -572,7 +674,7 @@ command_popup_restore() {
         printf '\nStarting fresh.\n'
         debug_log "restore prompt declined client=$client workspaces=$workspaces tabs=$windows panes=$panes"
         trap - EXIT
-        command_restore_discard
+        command_restore_discard "$client"
     fi
 }
 
@@ -610,7 +712,7 @@ command_restore_start() {
         debug_log "restore start skipped client=$client handled=$handled"
         return 0
     fi
-    [[ -f $RESTORE_FILE ]] || { command_restore_discard; return; }
+    [[ -f $RESTORE_FILE ]] || { command_restore_discard "$client"; return; }
     mode=$(tmux_cmd show-options -gqv @atelier_restore 2>/dev/null || true)
     mode=${mode:-prompt}
     debug_log "restore start client=$client mode=$mode"
@@ -618,7 +720,7 @@ command_restore_start() {
         die 'invalid @atelier_restore value: expected always, never, or prompt'
     case $mode in
         always) command_restore "$client" ;;
-        never) command_restore_discard ;;
+        never) command_restore_discard "$client" ;;
         prompt)
             [[ -n $client ]] || return 0
             cli=$(cli_path); qcli=$(quote_sh "$cli")
@@ -1448,6 +1550,7 @@ Commands:
   popup-tab-menu WINDOW_ID
   snapshot
   restore-start [CLIENT]
+  adopt-session SESSION [CLIENT]
   refresh-status
 EOF
 }
@@ -1487,6 +1590,7 @@ main() {
         restore-start) (($# <= 1)) || die 'usage: tmux-atelier restore-start [client]'; command_restore_start "$@" ;;
         restore) (($# <= 1)) || die 'usage: tmux-atelier restore [client]'; command_restore "$@" ;;
         restore-discard) (($# == 0)) || die 'usage: tmux-atelier restore-discard'; command_restore_discard ;;
+        adopt-session) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier adopt-session session [client]'; command_adopt_session "$@" ;;
         debug-path) (($# == 0)) || die 'usage: tmux-atelier debug-path'; printf '%s\n' "$DEBUG_LOG" ;;
         debug-clear) (($# == 0)) || die 'usage: tmux-atelier debug-clear'; mkdir -p "$STATE_ROOT"; : > "$DEBUG_LOG"; chmod 600 "$DEBUG_LOG" ;;
         help|-h|--help) (($# == 0)) || die 'usage: tmux-atelier help'; usage ;;

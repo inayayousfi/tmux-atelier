@@ -9,6 +9,8 @@ TEST_BIN="$TEST_ROOT/bin"
 STATE_DIR="$TEST_ROOT/state"
 LOCAL_ONE="$TEST_ROOT/local one=ok"
 LOCAL_TWO="$TEST_ROOT/local two"
+ADOPT_ROOT="$TEST_ROOT/native adopted"
+ADOPT_RACE_ROOT="$TEST_ROOT/native race"
 SSH_LOG="$TEST_ROOT/ssh.log"
 COMMAND_LOG="$TEST_ROOT/tmux-command.log"
 WIZARD_HOME="$TEST_ROOT/wizard-home"
@@ -105,7 +107,7 @@ quote_sh() {
     printf "'%s'" "$value"
 }
 
-mkdir -p "$TEST_BIN" "$LOCAL_ONE" "$LOCAL_TWO" \
+mkdir -p "$TEST_BIN" "$LOCAL_ONE" "$LOCAL_TWO" "$ADOPT_ROOT" "$ADOPT_RACE_ROOT" \
     "$WIZARD_HOME/projects/.hidden/< Back>" "$WIZARD_HOME/.ssh/config.d"
 printf 'Include config.d/*\n' > "$WIZARD_HOME/.ssh/config"
 printf 'Host included\n  User deploy\n  HostName app.internal\n  Port 2200\n\nHost custom\n' \
@@ -290,8 +292,12 @@ assert_contains "$ATELIER_BINDINGS" 'request-tab-rename' 'native tab rename key 
 assert_contains "$ATELIER_BINDINGS" 'request-tab-close' 'native tab close key updates the snapshot'
 assert_contains "$ATELIER_BINDINGS" 'request-rename' 'native session rename key updates the saved workspace'
 assert_contains "$("$TMUX" show-hooks -g client-attached)" 'restore-start' 'client attachment checks for a saved topology'
-"$TMUX" list-keys -T root | grep -F 'MouseDown1Status' >/dev/null || fail 'left status click is bound'
-pass 'left status click is bound'
+if "$TMUX" list-keys -T root | grep -E -- '-T root[[:space:]]+MouseDown1Status[[:space:]]' >/dev/null; then
+    fail 'left status press is unbound to avoid starting pane selection after a switch'
+fi
+pass 'left status press is unbound to avoid starting pane selection after a switch'
+"$TMUX" list-keys -T root | grep -F 'MouseUp1Status' >/dev/null || fail 'left status release is bound'
+pass 'left status release is bound'
 "$TMUX" list-keys -T root | grep -F 'status-menu' >/dev/null || fail 'right workspace click is bound'
 pass 'right workspace click is bound'
 RIGHT_CLICK_BINDING=$("$TMUX" list-keys -T root | grep -F 'MouseDown3Status ')
@@ -300,14 +306,79 @@ assert_contains "$RIGHT_CLICK_BINDING" 'popup-tab-menu' 'right tab click opens t
 assert_contains "$RIGHT_CLICK_BINDING" '#{window_id}' 'tab menu receives the clicked window id'
 "$TMUX" show-hooks -g session-created | grep -F 'refresh-status' >/dev/null || fail 'session hook refreshes status'
 pass 'session hook refreshes status'
-"$TMUX" new-session -d -s native-after-plugin 'sleep 120'
+assert_contains "$("$TMUX" show-hooks -g session-created)" 'adopt-session' 'session hook adopts new native sessions'
+"$TMUX" new-session -d -s native-after-plugin -c "$ADOPT_ROOT" 'sleep 120'
 for _ in {1..10}; do
-    HOOK_STATUS=$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')
-    [[ $HOOK_STATUS == *native-after-plugin@tmux* ]] && break
+    "$TMUX" has-session -t '=native-adopted' 2>/dev/null && break
     sleep 0.2
 done
-assert_contains "$HOOK_STATUS" 'native-after-plugin@tmux' 'session hook executes refresh-status with its argument'
-assert_order "$HOOK_STATUS" a-created native-after-plugin 'new native sessions are appended by creation time'
+"$TMUX" has-session -t '=native-adopted' || fail 'native session is renamed from its current directory'
+pass 'native session is renamed from its current directory'
+assert_no_file "$STATE_DIR/workspaces/native-after-plugin" 'raw native session name is not persisted'
+assert_file "$STATE_DIR/workspaces/native-adopted" 'adopted local workspace is persisted'
+assert_equal local "$(stored_value "$STATE_DIR/workspaces/native-adopted" destination)" 'adopted workspace is local'
+assert_equal "$ADOPT_ROOT" "$(stored_value "$STATE_DIR/workspaces/native-adopted" path)" 'adopted workspace stores its canonical directory'
+assert_equal 1 "$("$TMUX" show-options -qv -t '=native-adopted:' @atelier_managed)" 'adopted session is marked as managed'
+for _ in {1..10}; do
+    HOOK_STATUS=$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')
+    [[ $HOOK_STATUS == *native-adopted@local* ]] && break
+    sleep 0.1
+done
+assert_contains "$HOOK_STATUS" 'native-adopted@local' 'adopted workspace replaces the native status entry'
+assert_order "$HOOK_STATUS" a-created native-adopted 'adopted workspaces are appended by creation time'
+
+"$TMUX" new-session -d -s duplicate-native -c "$LOCAL_TWO" 'sleep 120'
+for _ in {1..10}; do
+    "$TMUX" has-session -t '=duplicate-native' 2>/dev/null || break
+    sleep 0.2
+done
+assert_fails 'native session reuses a live workspace with the same directory' "$TMUX" has-session -t '=duplicate-native'
+"$CLI" close native-adopted
+"$TMUX" new-session -d -s reopen-native -c "$ADOPT_ROOT" 'sleep 120'
+for _ in {1..10}; do
+    "$TMUX" has-session -t '=native-adopted' 2>/dev/null && break
+    sleep 0.2
+done
+"$TMUX" has-session -t '=native-adopted' || fail 'native session reopens a stopped workspace with the same directory'
+pass 'native session reopens a stopped workspace with the same directory'
+
+"$TMUX" set-option -gq @atelier_restore_pending 1
+"$TMUX" new-session -d -s attached-duplicate -c "$ADOPT_ROOT" 'sleep 120'
+sleep 0.2
+sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=attached-duplicate' > "$TEST_ROOT/adopt-client.log" 2>&1 &
+ADOPT_CLIENT_PID=$!
+ADOPT_CLIENT=
+for _ in {1..10}; do
+    ADOPT_CLIENT=$("$TMUX" list-clients -F '#{client_name}' 2>/dev/null || true)
+    [[ -n $ADOPT_CLIENT ]] && break
+    sleep 0.1
+done
+[[ -n $ADOPT_CLIENT ]] || fail "control client starts for attached adoption: $(< "$TEST_ROOT/adopt-client.log")"
+sleep 0.2
+"$TMUX" set-option -gq @atelier_restore_pending 0
+"$CLI" adopt-session attached-duplicate
+assert_fails 'adoption removes an attached duplicate session' "$TMUX" has-session -t '=attached-duplicate'
+assert_equal native-adopted "$("$TMUX" display-message -p -c "$ADOPT_CLIENT" '#{session_name}')" 'adoption switches an inferred client to the existing workspace'
+"$TMUX" detach-client -t "$ADOPT_CLIENT"
+wait "$ADOPT_CLIENT_PID" 2>/dev/null || true
+
+"$TMUX" new-session -d -s race-native-one -c "$ADOPT_RACE_ROOT" 'sleep 120' &
+RACE_NATIVE_ONE_PID=$!
+"$TMUX" new-session -d -s race-native-two -c "$ADOPT_RACE_ROOT" 'sleep 120' &
+RACE_NATIVE_TWO_PID=$!
+wait "$RACE_NATIVE_ONE_PID" "$RACE_NATIVE_TWO_PID"
+for _ in {1..20}; do
+    if "$TMUX" has-session -t '=native-race' 2>/dev/null &&
+        ! "$TMUX" has-session -t '=race-native-one' 2>/dev/null &&
+        ! "$TMUX" has-session -t '=race-native-two' 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+"$TMUX" has-session -t '=native-race' || fail 'concurrent native sessions create one workspace'
+pass 'concurrent native sessions create one workspace'
+assert_fails 'concurrent adoption removes the first temporary session' "$TMUX" has-session -t '=race-native-one'
+assert_fails 'concurrent adoption removes the second temporary session' "$TMUX" has-session -t '=race-native-two'
 
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
@@ -547,9 +618,20 @@ export TMUX_ATELIER_TEST_SOCKET="atelier-restore-always-$$"
 "$TMUX" set-option -g @atelier_restore always
 "$CLI" restore-arm
 assert_equal 1 "$("$TMUX" show-options -gqv @atelier_restore_pending)" 'saved topology arms restoration on a fresh server'
-"$CLI" restore-start
+sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=bootstrap' > "$TEST_ROOT/restore-client.log" 2>&1 &
+RESTORE_CLIENT_PID=$!
+RESTORE_CLIENT=
+for _ in {1..10}; do
+    RESTORE_CLIENT=$("$TMUX" list-clients -F '#{client_name}' 2>/dev/null || true)
+    [[ -n $RESTORE_CLIENT ]] && break
+    sleep 0.1
+done
+[[ -n $RESTORE_CLIENT ]] || fail "control client starts for restoration: $(< "$TEST_ROOT/restore-client.log")"
+"$CLI" restore-start "$RESTORE_CLIENT"
 "$TMUX" has-session -t '=restore-me' || fail 'always policy restores the saved workspace'
 pass 'always policy restores the saved workspace'
+assert_fails 'successful restoration removes the current-directory bootstrap session' "$TMUX" has-session -t '=bootstrap'
+assert_equal restore-me "$("$TMUX" display-message -p -c "$RESTORE_CLIENT" '#{session_name}')" 'restoration switches the client to the previously active workspace'
 "$TMUX" has-session -t '=restore-remote' || fail 'always policy restores remote workspaces'
 pass 'always policy restores remote workspaces'
 "$TMUX" has-session -t '=restore-bad' || fail 'always policy restores every valid local workspace'
@@ -562,6 +644,8 @@ assert_equal "$SOURCE_MAIN_GEOMETRY" "$("$TMUX" list-panes -t "$RESTORED_FIRST_W
 assert_equal "$SOURCE_MAIN_PATHS" "$("$TMUX" list-panes -t "$RESTORED_FIRST_WINDOW" -F '#{pane_current_path}')" 'restoration preserves local pane directories'
 assert_equal main "$("$TMUX" display-message -p -t '=restore-me:' '#{window_name}')" 'restoration preserves the active tab'
 assert_equal "$SOURCE_ACTIVE_GEOMETRY" "$("$TMUX" display-message -p -t '=restore-me:' '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')" 'restoration preserves the active pane'
+"$TMUX" detach-client -t "$RESTORE_CLIENT"
+wait "$RESTORE_CLIENT_PID" 2>/dev/null || true
 "$TMUX" kill-server
 
 cp "$TEST_ROOT/valid-restore.snapshot" "$RESTORE_STATE/restore.snapshot"
