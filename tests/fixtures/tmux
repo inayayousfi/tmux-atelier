@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+: "${TMUX_ATELIER_REAL_TMUX:?}"
+exec "$TMUX_ATELIER_REAL_TMUX" -L "${TMUX_ATELIER_TEST_SOCKET:?}" "$@"

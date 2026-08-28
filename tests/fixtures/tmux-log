@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+: "${TMUX_ATELIER_COMMAND_LOG:?}"
+
+if [[ ${1:-} == show-options ]]; then
+    printf '%s\n' "${TMUX_ATELIER_CLI_FOR_TEST:?}"
+    exit 0
+fi
+
+printf '%s\0' "$@" >> "$TMUX_ATELIER_COMMAND_LOG"

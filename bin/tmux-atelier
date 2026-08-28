@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly TMUX_BIN="${TMUX_ATELIER_TMUX:-tmux}"
+readonly STATE_ROOT="${TMUX_ATELIER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-atelier}"
+readonly WORKSPACES_DIR="$STATE_ROOT/workspaces"
+
+WORKSPACE_NAME=
+WORKSPACE_DESTINATION=
+WORKSPACE_PATH=
+declare -A SSH_CONFIG_SEEN=()
+
+die() {
+    printf 'tmux-atelier: %s\n' "$*" >&2
+    exit 1
+}
+
+tmux_cmd() {
+    "$TMUX_BIN" "$@"
+}
+
+validate_name() {
+    [[ $1 =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid workspace name: $1"
+}
+
+validate_value() {
+    local label=$1 value=$2
+    [[ -n $value ]] || die "$label must not be empty"
+    [[ $value != *$'\n'* && $value != *$'\r'* ]] || die "$label must not contain a newline"
+}
+
+validate_destination() {
+    validate_value destination "$1"
+    [[ $1 == local || $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]*$ ]] ||
+        die "invalid OpenSSH destination: $1"
+}
+
+workspace_file() {
+    validate_name "$1"
+    printf '%s/%s\n' "$WORKSPACES_DIR" "$1"
+}
+
+read_workspace() {
+    local name=$1 file key value
+    local seen_name=0 seen_destination=0 seen_path=0
+
+    file=$(workspace_file "$name")
+    [[ -f $file ]] || die "workspace not found: $name"
+
+    WORKSPACE_NAME=
+    WORKSPACE_DESTINATION=
+    WORKSPACE_PATH=
+    while IFS='=' read -r key value || [[ -n $key ]]; do
+        case $key in
+            name)
+                ((seen_name == 0)) || die "duplicate name in workspace: $name"
+                WORKSPACE_NAME=$value
+                seen_name=1
+                ;;
+            destination)
+                ((seen_destination == 0)) || die "duplicate destination in workspace: $name"
+                WORKSPACE_DESTINATION=$value
+                seen_destination=1
+                ;;
+            path)
+                ((seen_path == 0)) || die "duplicate path in workspace: $name"
+                WORKSPACE_PATH=$value
+                seen_path=1
+                ;;
+            ''|'#'*) ;;
+        esac
+    done < "$file"
+
+    ((seen_name && seen_destination && seen_path)) || die "incomplete workspace: $name"
+    [[ $WORKSPACE_NAME == "$name" ]] || die "workspace name does not match its filename: $name"
+    validate_name "$WORKSPACE_NAME"
+    validate_destination "$WORKSPACE_DESTINATION"
+    validate_value path "$WORKSPACE_PATH"
+}
+
+write_workspace() {
+    local name=$1 destination=$2 path=$3 mode=${4:-replace} file temporary
+    validate_name "$name"
+    validate_destination "$destination"
+    validate_value path "$path"
+
+    mkdir -p "$WORKSPACES_DIR" || return 1
+    chmod 700 "$WORKSPACES_DIR" || return 1
+    file=$(workspace_file "$name")
+    temporary=$(mktemp "$WORKSPACES_DIR/.${name}.XXXXXX") || return 1
+    chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+    if ! printf 'name=%s\ndestination=%s\npath=%s\n' "$name" "$destination" "$path" > "$temporary"; then
+        rm -f "$temporary"
+        return 1
+    fi
+    if [[ $mode == create ]]; then
+        if ! ln "$temporary" "$file" 2>/dev/null; then
+            rm -f "$temporary"
+            return 1
+        fi
+        rm -f "$temporary"
+    else
+        mv -f "$temporary" "$file"
+    fi
+}
+
+parse_target() {
+    local target=$1
+    [[ $target == *:* ]] || die "target must use destination:path"
+    WORKSPACE_DESTINATION=${target%%:*}
+    WORKSPACE_PATH=${target#*:}
+    validate_destination "$WORKSPACE_DESTINATION"
+    validate_value path "$WORKSPACE_PATH"
+}
+
+normalise_name() {
+    local path=$1 candidate base suffix=2
+    base=${path%/}
+    base=${base##*/}
+    [[ -n $base && $base != '.' && $base != '~' ]] || base=workspace
+    candidate=${base//[^A-Za-z0-9_-]/-}
+    candidate=${candidate#-}
+    candidate=${candidate%-}
+    [[ -n $candidate ]] || candidate=workspace
+    base=$candidate
+    while [[ -e $WORKSPACES_DIR/$candidate ]] || session_exists "$candidate"; do
+        candidate="$base-$suffix"
+        ((suffix++))
+    done
+    printf '%s\n' "$candidate"
+}
+
+session_exists() {
+    tmux_cmd has-session -t "=$1" 2>/dev/null
+}
+
+session_option() {
+    tmux_cmd show-options -qv -t "=$1:" "$2" 2>/dev/null || true
+}
+
+quote_sh() {
+    local value=${1//\'/\'\\\'\'}
+    printf "'%s'" "$value"
+}
+
+remote_shell_command() {
+    local destination=$1 path=$2 remote command inner
+    # $1 and $SHELL are intentionally expanded by the remote POSIX shell.
+    # shellcheck disable=SC2016
+    inner='cd -- "$1" && exec "${SHELL:-/bin/sh}" -l'
+    remote="sh -c $(quote_sh "$inner") sh $(quote_sh "$path")"
+    command="exec ssh -t $(quote_sh "$destination") $(quote_sh "$remote")"
+    printf '%s\n' "$command"
+}
+
+mark_session() {
+    local name=$1 destination=$2 path=$3
+    tmux_cmd set-option -q -t "=$name:" @atelier_managed 1
+    tmux_cmd set-option -q -t "=$name:" @atelier_destination "$destination"
+    tmux_cmd set-option -q -t "=$name:" @atelier_path "$path"
+}
+
+create_session() {
+    local name=$1 destination=$2 path=$3 command
+    if [[ $destination == local ]]; then
+        [[ -d $path ]] || die "local path is not a directory: $path"
+        tmux_cmd new-session -d -s "$name" -c "$path" || return 1
+    else
+        command=$(remote_shell_command "$destination" "$path")
+        tmux_cmd new-session -d -s "$name" "$command" || return 1
+    fi
+    if ! mark_session "$name" "$destination" "$path"; then
+        tmux_cmd kill-session -t "=$name" 2>/dev/null || true
+        return 1
+    fi
+}
+
+refresh_status_if_running() {
+    tmux_cmd list-sessions >/dev/null 2>&1 || return 0
+    command_refresh_status
+}
+
+select_session() {
+    local name=$1 detached=${2:-0}
+    ((detached)) && return 0
+    if [[ -n ${TMUX:-} ]]; then
+        tmux_cmd switch-client -t "=$name"
+    else
+        exec "$TMUX_BIN" attach-session -t "=$name"
+    fi
+}
+
+command_new() {
+    local target=${1:-} name=${2:-} detached=${3:-}
+    [[ -n $target ]] || die 'usage: tmux-atelier new destination:path [name] [--detached]'
+    [[ $name != --detached ]] || { detached=$name; name=; }
+    [[ -z $detached || $detached == --detached ]] || die "unknown argument: $detached"
+
+    parse_target "$target"
+    [[ -n $name ]] || name=$(normalise_name "$WORKSPACE_PATH")
+    validate_name "$name"
+    [[ ! -e $(workspace_file "$name") ]] || die "workspace already exists: $name"
+    ! session_exists "$name" || die "tmux session already exists: $name"
+    [[ $WORKSPACE_DESTINATION != local || -d $WORKSPACE_PATH ]] ||
+        die "local path is not a directory: $WORKSPACE_PATH"
+
+    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" create ||
+        die "workspace already exists: $name"
+    if ! create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH"; then
+        die "definition saved, but the session could not be created: $name"
+    fi
+    refresh_status_if_running
+    select_session "$name" "$([[ $detached == --detached ]] && printf 1 || printf 0)"
+}
+
+command_open() {
+    local name=${1:-} detached=${2:-} destination path
+    [[ -n $name ]] || die 'usage: tmux-atelier open name [--detached]'
+    validate_name "$name"
+    [[ -z $detached || $detached == --detached ]] || die "unknown argument: $detached"
+
+    if session_exists "$name" && [[ -f $(workspace_file "$name") ]]; then
+        read_workspace "$name"
+        destination=$(session_option "$name" @atelier_destination)
+        path=$(session_option "$name" @atelier_path)
+        [[ $(session_option "$name" @atelier_managed) == 1 &&
+            $destination == "$WORKSPACE_DESTINATION" && $path == "$WORKSPACE_PATH" ]] ||
+            die "saved workspace conflicts with tmux session: $name"
+    elif ! session_exists "$name"; then
+        read_workspace "$name"
+        create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH"
+    fi
+    refresh_status_if_running
+    select_session "$name" "$([[ $detached == --detached ]] && printf 1 || printf 0)"
+}
+
+current_session() {
+    tmux_cmd display-message -p '#{session_name}'
+}
+
+command_window() {
+    local session=${1:-} destination path command
+    [[ -n $session ]] || session=$(current_session)
+    if [[ $(session_option "$session" @atelier_managed) != 1 ]]; then
+        tmux_cmd new-window -t "=$session:"
+        return
+    fi
+    destination=$(session_option "$session" @atelier_destination)
+    path=$(session_option "$session" @atelier_path)
+    if [[ $destination == local ]]; then
+        tmux_cmd new-window -t "=$session:" -c "$path"
+    else
+        command=$(remote_shell_command "$destination" "$path")
+        tmux_cmd new-window -t "=$session:" "$command"
+    fi
+}
+
+command_split() {
+    local orientation=${1:-} pane=${2:-} session destination path command
+    [[ $orientation == vertical || $orientation == horizontal ]] ||
+        die 'usage: tmux-atelier split vertical|horizontal [pane]'
+    [[ -n $pane ]] || pane=$(tmux_cmd display-message -p '#{pane_id}')
+    session=$(tmux_cmd display-message -p -t "$pane" '#{session_name}')
+
+    local -a split_args=(split-window -t "$pane")
+    [[ $orientation == vertical ]] && split_args+=(-h)
+    if [[ $(session_option "$session" @atelier_managed) != 1 ]]; then
+        tmux_cmd "${split_args[@]}"
+        return
+    fi
+    destination=$(session_option "$session" @atelier_destination)
+    path=$(session_option "$session" @atelier_path)
+    if [[ $destination == local ]]; then
+        tmux_cmd "${split_args[@]}" -c "$path"
+    else
+        command=$(remote_shell_command "$destination" "$path")
+        tmux_cmd "${split_args[@]}" "$command"
+    fi
+}
+
+definition_names() {
+    local file
+    [[ -d $WORKSPACES_DIR ]] || return 0
+    while IFS= read -r -d '' file; do
+        printf '%s\n' "${file##*/}"
+    done < <(find "$WORKSPACES_DIR" -maxdepth 1 -type f ! -name '.*' -print0)
+}
+
+session_names() {
+    tmux_cmd list-sessions -F '#{session_name}' 2>/dev/null || true
+}
+
+all_names() {
+    { definition_names; session_names; } | LC_ALL=C sort -u
+}
+
+escape_format() {
+    printf '%s' "${1//#/##}"
+}
+
+clear_range_options() {
+    local option
+    while IFS= read -r option; do
+        [[ $option == @atelier_range_* ]] || continue
+        tmux_cmd set-option -gu "$option" 2>/dev/null || true
+    done < <(tmux_cmd show-options -g -F '#{option_name}' 2>/dev/null || true)
+}
+
+workspace_label() {
+    local name=$1 definition destination path
+    if [[ -f $WORKSPACES_DIR/$name ]]; then
+        if definition=$( (read_workspace "$name"; printf '%s\n%s' "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH") 2>/dev/null); then
+            destination=${definition%%$'\n'*}
+            path=${definition#*$'\n'}
+            if session_exists "$name" &&
+                { [[ $(session_option "$name" @atelier_managed) != 1 ]] ||
+                  [[ $(session_option "$name" @atelier_destination) != "$destination" ]] ||
+                  [[ $(session_option "$name" @atelier_path) != "$path" ]]; }; then
+                printf '%s@conflict' "$name"
+                return
+            fi
+            destination=${destination##*@}
+            printf '%s@%s' "$name" "$destination"
+        else
+            printf '%s@invalid' "$name"
+        fi
+    elif [[ $(session_option "$name" @atelier_managed) == 1 ]]; then
+        destination=$(session_option "$name" @atelier_destination)
+        printf '%s@%s' "$name" "${destination##*@}"
+    else
+        printf '%s@tmux' "$name"
+    fi
+}
+
+status_line_for() {
+    local active=$1 name token label style line='' index=0
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        token="a$index"
+        tmux_cmd set-option -gq "@atelier_range_$token" "$name"
+        label=$(escape_format "$(workspace_label "$name")")
+        if [[ $name == "$active" ]]; then
+            style='reverse'
+        elif session_exists "$name"; then
+            style='bold'
+        else
+            style='dim'
+        fi
+        line+="#[range=user|$token,$style] $label #[default,norange]│"
+        ((++index))
+    done < <(all_names)
+    line+="#[range=user|new,bold] + #[default,norange]"
+    printf '%s\n' "$line"
+}
+
+command_refresh_status() {
+    local session line
+    clear_range_options
+    while IFS= read -r session; do
+        [[ -n $session ]] || continue
+        line=$(status_line_for "$session")
+        tmux_cmd set-option -q -t "=$session:" 'status-format[0]' "$line"
+    done < <(session_names)
+}
+
+range_name() {
+    local token=$1
+    tmux_cmd show-options -gqv "@atelier_range_$token" 2>/dev/null || true
+}
+
+command_status_click() {
+    local token=${1:-} name
+    [[ $token == new ]] && { command_show_new_popup; return; }
+    name=$(range_name "$token")
+    [[ -n $name ]] || return 0
+    if session_exists "$name"; then
+        tmux_cmd switch-client -t "=$name"
+    else
+        command_open "$name"
+    fi
+}
+
+command_show_new_popup() {
+    local cli qcli
+    cli=$(cli_path)
+    qcli=$(quote_sh "$cli")
+    tmux_cmd display-popup -E -w '70%' -h '60%' "$qcli popup-new"
+}
+
+command_status_menu() {
+    local token=${1:-} name
+    name=$(range_name "$token")
+    [[ -n $name ]] || return 0
+    command_menu "$name"
+}
+
+cli_path() {
+    local configured
+    configured=$(tmux_cmd show-options -gqv @atelier_cli 2>/dev/null || true)
+    [[ -n $configured ]] || die '@atelier_cli is not configured'
+    printf '%s\n' "$configured"
+}
+
+command_menu() {
+    local name=${1:-} cli qcli qname
+    [[ -n $name ]] || die 'usage: tmux-atelier menu name'
+    cli=$(cli_path)
+    qcli=$(quote_sh "$cli")
+    qname=$(quote_sh "$name")
+    tmux_cmd display-menu -T " $name " \
+        'Open' o "run-shell -b $qcli open $qname" \
+        'Rename' r "display-popup -E -w 60% -h 30% $qcli popup-rename $qname" \
+        'Edit target' e "display-popup -E -w 70% -h 35% $qcli popup-edit $qname" \
+        '' \
+        'Close session' x "run-shell -b $qcli request-close $qname" \
+        'Delete definition' d "run-shell -b $qcli request-delete $qname"
+}
+
+command_close() {
+    local name=${1:-}
+    validate_name "$name"
+    session_exists "$name" || die "session is not running: $name"
+    tmux_cmd kill-session -t "=$name"
+    refresh_status_if_running
+}
+
+command_delete() {
+    local name=${1:-} file
+    file=$(workspace_file "$name")
+    [[ -f $file ]] || die "workspace definition not found: $name"
+    rm -f "$file"
+    refresh_status_if_running
+}
+
+command_request_close() {
+    local name=${1:-} cli qcli qname
+    validate_name "$name"
+    cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
+    tmux_cmd confirm-before -p "Close session $name? (y/n)" "run-shell -b $qcli close $qname"
+}
+
+command_request_delete() {
+    local name=${1:-} cli qcli qname
+    validate_name "$name"
+    cli=$(cli_path); qcli=$(quote_sh "$cli"); qname=$(quote_sh "$name")
+    tmux_cmd confirm-before -p "Delete definition $name? (y/n)" "run-shell -b $qcli delete $qname"
+}
+
+command_rename() {
+    local old=${1:-} new=${2:-} old_file new_file session_renamed=0
+    local destination='' path=''
+    validate_name "$old"
+    validate_name "$new"
+    [[ $old != "$new" ]] || return 0
+    old_file=$(workspace_file "$old")
+    new_file=$(workspace_file "$new")
+    [[ ! -e $new_file ]] || die "workspace already exists: $new"
+    ! session_exists "$new" || die "tmux session already exists: $new"
+    [[ -f $old_file ]] || session_exists "$old" || die "workspace not found: $old"
+
+    if [[ -f $old_file ]]; then
+        read_workspace "$old"
+        destination=$WORKSPACE_DESTINATION
+        path=$WORKSPACE_PATH
+    fi
+
+    if session_exists "$old"; then
+        tmux_cmd rename-session -t "=$old" "$new"
+        session_renamed=1
+    fi
+    if [[ -f $old_file ]]; then
+        if ! write_workspace "$new" "$destination" "$path" create; then
+            ((session_renamed)) && tmux_cmd rename-session -t "=$new" "$old" || true
+            die "could not rename workspace: $old"
+        fi
+        rm -f "$old_file"
+    fi
+    refresh_status_if_running
+}
+
+command_edit() {
+    local name=${1:-} target=${2:-}
+    validate_name "$name"
+    [[ -n $target ]] || die 'usage: tmux-atelier edit name destination:path'
+    ! session_exists "$name" || die "close the session before editing its target: $name"
+    read_workspace "$name"
+    parse_target "$target"
+    [[ $WORKSPACE_DESTINATION != local || -d $WORKSPACE_PATH ]] ||
+        die "local path is not a directory: $WORKSPACE_PATH"
+    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" ||
+        die "could not update workspace: $name"
+    refresh_status_if_running
+}
+
+ssh_aliases_from() {
+    local file=$1 line keyword rest pattern include base expanded
+    local -a lines
+    [[ -f $file ]] || return 0
+    file=$(readlink -f "$file")
+    [[ -z ${SSH_CONFIG_SEEN[$file]:-} ]] || return 0
+    SSH_CONFIG_SEEN[$file]=1
+    mapfile -t lines < "$file"
+    for line in "${lines[@]}"; do
+        line=${line%%#*}
+        read -r keyword rest <<< "$line"
+        case ${keyword,,} in
+            host)
+                for pattern in $rest; do
+                    [[ $pattern != *['*?!']* && $pattern != '!'* ]] && printf '%s\n' "$pattern"
+                done
+                ;;
+            include)
+                base=${file%/*}
+                for include in $rest; do
+                    include=${include/#\~/$HOME}
+                    [[ $include == /* ]] || include="$base/$include"
+                    while IFS= read -r expanded; do
+                        [[ -n $expanded && $expanded != "$file" ]] && ssh_aliases_from "$expanded"
+                    done < <(compgen -G "$include" || true)
+                done
+                ;;
+        esac
+    done
+}
+
+choose_destination() {
+    local output selected
+    output=$({ printf 'local\n'; ssh_aliases_from "$HOME/.ssh/config"; } |
+        LC_ALL=C sort -u |
+        fzf --print-query --bind=enter:accept --prompt='Destination > ' --height=100% --border)
+    selected=${output##*$'\n'}
+    [[ -n $selected ]] || selected=$output
+    validate_destination "$selected"
+    printf '%s\n' "$selected"
+}
+
+command_popup_new() {
+    local destination path name target
+    destination=$(choose_destination) || return 0
+    if [[ $destination == local ]]; then
+        read -r -e -p 'Path: ' -i "$PWD" path || return 0
+    else
+        read -r -e -p 'Remote path: ' path || return 0
+    fi
+    read -r -e -p 'Name (optional): ' name || return 0
+    target="$destination:$path"
+    if [[ -n $name ]]; then
+        command_new "$target" "$name"
+    else
+        command_new "$target"
+    fi
+}
+
+command_picker() {
+    local name
+    name=$(all_names | fzf --prompt='Workspace > ' --height=100% --border) || return 0
+    [[ -n $name ]] && command_open "$name"
+}
+
+command_popup_rename() {
+    local old=${1:-} new
+    validate_name "$old"
+    read -r -e -p 'New name: ' -i "$old" new || return 0
+    command_rename "$old" "$new"
+}
+
+command_popup_edit() {
+    local name=${1:-} target
+    validate_name "$name"
+    ! session_exists "$name" || die "close the session before editing its target: $name"
+    read_workspace "$name"
+    read -r -e -p 'Target: ' -i "$WORKSPACE_DESTINATION:$WORKSPACE_PATH" target || return 0
+    command_edit "$name" "$target"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: tmux-atelier COMMAND [ARGUMENTS]
+
+Commands:
+  new TARGET [NAME] [--detached]
+  open NAME [--detached]
+  window [SESSION]
+  split vertical|horizontal [PANE]
+  rename OLD NEW
+  edit NAME TARGET
+  close NAME
+  delete NAME
+  picker
+  popup-new
+  refresh-status
+EOF
+}
+
+main() {
+    local command=${1:-}
+    [[ -n $command ]] || { usage; exit 1; }
+    shift
+    case $command in
+        new) ((1 <= $# && $# <= 3)) || die 'usage: tmux-atelier new destination:path [name] [--detached]'; command_new "$@" ;;
+        open) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier open name [--detached]'; command_open "$@" ;;
+        window) (($# <= 1)) || die 'usage: tmux-atelier window [session]'; command_window "$@" ;;
+        split) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier split vertical|horizontal [pane]'; command_split "$@" ;;
+        rename) (($# == 2)) || die 'usage: tmux-atelier rename old new'; command_rename "$@" ;;
+        edit) (($# == 2)) || die 'usage: tmux-atelier edit name destination:path'; command_edit "$@" ;;
+        close) (($# == 1)) || die 'usage: tmux-atelier close name'; command_close "$@" ;;
+        delete) (($# == 1)) || die 'usage: tmux-atelier delete name'; command_delete "$@" ;;
+        picker) (($# == 0)) || die 'usage: tmux-atelier picker'; command_picker ;;
+        popup-new) (($# == 0)) || die 'usage: tmux-atelier popup-new'; command_popup_new ;;
+        popup-rename) (($# == 1)) || die 'usage: tmux-atelier popup-rename name'; command_popup_rename "$@" ;;
+        popup-edit) (($# == 1)) || die 'usage: tmux-atelier popup-edit name'; command_popup_edit "$@" ;;
+        refresh-status) (($# == 0)) || die 'usage: tmux-atelier refresh-status'; command_refresh_status ;;
+        status-click) (($# == 1)) || die 'usage: tmux-atelier status-click range'; command_status_click "$@" ;;
+        status-menu) (($# == 1)) || die 'usage: tmux-atelier status-menu range'; command_status_menu "$@" ;;
+        menu) (($# == 1)) || die 'usage: tmux-atelier menu name'; command_menu "$@" ;;
+        request-close) (($# == 1)) || die 'usage: tmux-atelier request-close name'; command_request_close "$@" ;;
+        request-delete) (($# == 1)) || die 'usage: tmux-atelier request-delete name'; command_request_delete "$@" ;;
+        help|-h|--help) (($# == 0)) || die 'usage: tmux-atelier help'; usage ;;
+        *) die "unknown command: $command" ;;
+    esac
+}
+
+main "$@"

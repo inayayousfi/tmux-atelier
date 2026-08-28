@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TMUX_ATELIER_REAL_TMUX=$(command -v tmux)
+TEST_ROOT="$ROOT/.tmp/test.$$"
+TEST_BIN="$TEST_ROOT/bin"
+STATE_DIR="$TEST_ROOT/state"
+LOCAL_ONE="$TEST_ROOT/local one=ok"
+LOCAL_TWO="$TEST_ROOT/local two"
+SSH_LOG="$TEST_ROOT/ssh.log"
+COMMAND_LOG="$TEST_ROOT/tmux-command.log"
+
+export TMUX_ATELIER_TEST_SOCKET="atelier-test-$$"
+export TMUX_ATELIER_REAL_TMUX
+export TMUX_ATELIER_STATE_DIR="$STATE_DIR"
+export TMUX_ATELIER_SSH_LOG="$SSH_LOG"
+export TMUX_ATELIER_TMUX="$TEST_BIN/tmux"
+export PATH="$TEST_BIN:$PATH"
+
+CLI="$ROOT/bin/tmux-atelier"
+TMUX="$TEST_BIN/tmux"
+TESTS=0
+
+cleanup() {
+    "$TMUX" kill-server >/dev/null 2>&1 || true
+    rm -rf "$TEST_ROOT"
+}
+trap cleanup EXIT
+
+fail() {
+    printf 'not ok %d - %s\n' "$TESTS" "$*" >&2
+    exit 1
+}
+
+pass() {
+    ((++TESTS))
+    printf 'ok %d - %s\n' "$TESTS" "$1"
+}
+
+assert_equal() {
+    local expected=$1 actual=$2 message=$3
+    [[ $actual == "$expected" ]] || fail "$message (expected '$expected', got '$actual')"
+    pass "$message"
+}
+
+assert_contains() {
+    local value=$1 expected=$2 message=$3
+    [[ $value == *"$expected"* ]] || fail "$message (missing '$expected' in '$value')"
+    pass "$message"
+}
+
+assert_file() {
+    [[ -f $1 ]] || fail "$2"
+    pass "$2"
+}
+
+assert_no_file() {
+    [[ ! -e $1 ]] || fail "$2"
+    pass "$2"
+}
+
+assert_fails() {
+    local message=$1
+    shift
+    if "$@" > "$TEST_ROOT/error.log" 2>&1; then
+        fail "$message"
+    fi
+    pass "$message"
+}
+
+quote_sh() {
+    local value=${1//\'/\'\\\'\'}
+    printf "'%s'" "$value"
+}
+
+mkdir -p "$TEST_BIN" "$LOCAL_ONE" "$LOCAL_TWO"
+cp "$ROOT/tests/fixtures/tmux" "$TEST_BIN/tmux"
+cp "$ROOT/tests/fixtures/ssh" "$TEST_BIN/ssh"
+chmod +x "$TEST_BIN/tmux" "$TEST_BIN/ssh"
+
+"$CLI" new "local:$LOCAL_ONE" local-one --detached
+assert_file "$STATE_DIR/workspaces/local-one" 'local definition is persisted'
+assert_equal 600 "$(stat -c '%a' "$STATE_DIR/workspaces/local-one")" 'definition permissions are private'
+assert_contains "$(< "$STATE_DIR/workspaces/local-one")" 'path='"$LOCAL_ONE" 'spaces and equals are preserved'
+assert_equal local "$("$TMUX" show-options -qv -t '=local-one:' @atelier_destination)" 'local destination is stored in tmux'
+assert_equal "$LOCAL_ONE" "$("$TMUX" display-message -p -t '=local-one:' '#{pane_current_path}')" 'initial local pane uses workspace path'
+
+"$CLI" window local-one
+assert_equal 2 "$("$TMUX" list-windows -t '=local-one' -F '#{window_id}' | wc -l)" 'new window stays in the workspace'
+assert_equal "$LOCAL_ONE" "$("$TMUX" display-message -p -t '=local-one:1' '#{pane_current_path}')" 'new local window inherits path'
+PANE=$("$TMUX" display-message -p -t '=local-one:1' '#{pane_id}')
+"$CLI" split vertical "$PANE"
+assert_equal 2 "$("$TMUX" list-panes -t '=local-one:1' -F '#{pane_id}' | wc -l)" 'vertical split is created'
+while IFS= read -r path; do
+    assert_equal "$LOCAL_ONE" "$path" 'local split inherits path'
+done < <("$TMUX" list-panes -t '=local-one:1' -F '#{pane_current_path}')
+
+assert_fails 'live workspace target cannot be edited' "$CLI" edit local-one "local:$LOCAL_TWO"
+"$CLI" close local-one
+assert_file "$STATE_DIR/workspaces/local-one" 'closing keeps the definition'
+"$CLI" edit local-one "local:$LOCAL_TWO"
+"$CLI" open local-one --detached
+assert_equal "$LOCAL_TWO" "$("$TMUX" display-message -p -t '=local-one:' '#{pane_current_path}')" 'stopped workspace reopens with edited path'
+
+"$CLI" rename local-one renamed
+assert_no_file "$STATE_DIR/workspaces/local-one" 'rename removes old definition'
+assert_file "$STATE_DIR/workspaces/renamed" 'rename writes new definition'
+"$TMUX" has-session -t '=renamed' || fail 'rename updates live tmux session'
+pass 'rename updates live tmux session'
+
+"$CLI" delete renamed
+assert_no_file "$STATE_DIR/workspaces/renamed" 'deleting removes only the definition'
+"$TMUX" has-session -t '=renamed' || fail 'deleting leaves the session alive'
+pass 'deleting leaves the session alive'
+
+assert_fails 'unsafe workspace names are rejected' "$CLI" new "local:$LOCAL_ONE" 'unsafe name' --detached
+assert_fails 'newlines in paths are rejected' "$CLI" new $'local:/tmp/bad\npath' newline --detached
+assert_fails 'extra arguments prevent destructive commands' "$CLI" close renamed unexpected
+"$TMUX" has-session -t '=renamed' || fail 'rejected close leaves the session alive'
+pass 'rejected close leaves the session alive'
+
+"$CLI" new "local:$LOCAL_ONE" conflict --detached
+"$CLI" close conflict
+"$TMUX" new-session -d -s conflict 'sleep 120'
+assert_fails 'native session cannot impersonate a saved workspace' "$CLI" open conflict --detached
+"$TMUX" kill-session -t '=conflict'
+
+mkdir -p "$TEST_ROOT/project"
+"$CLI" new "local:$TEST_ROOT/project" --detached
+"$CLI" close project
+"$CLI" new "local:$TEST_ROOT/project" --detached
+"$CLI" close project-2
+assert_file "$STATE_DIR/workspaces/project-2" 'automatic names receive collision suffixes'
+
+set +e
+"$CLI" new "local:$LOCAL_ONE" race --detached > "$TEST_ROOT/race-one.log" 2>&1 &
+RACE_ONE=$!
+"$CLI" new "local:$LOCAL_ONE" race --detached > "$TEST_ROOT/race-two.log" 2>&1 &
+RACE_TWO=$!
+wait "$RACE_ONE"; RACE_ONE_STATUS=$?
+wait "$RACE_TWO"; RACE_TWO_STATUS=$?
+set -e
+if ((RACE_ONE_STATUS == 0 && RACE_TWO_STATUS != 0)) ||
+   ((RACE_ONE_STATUS != 0 && RACE_TWO_STATUS == 0)); then
+    pass 'concurrent creation has exactly one winner'
+else
+    fail 'concurrent creation has exactly one winner'
+fi
+assert_file "$STATE_DIR/workspaces/race" 'concurrent creation keeps the winning definition'
+"$TMUX" has-session -t '=race' || fail 'concurrent creation keeps the winning session'
+pass 'concurrent creation keeps the winning session'
+
+REMOTE_PATH="/srv/app dir/it's"
+"$CLI" new "deploy@app:$REMOTE_PATH" remote --detached
+sleep 0.1
+mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
+assert_equal -t "${SSH_ARGS[0]}" 'ssh requests a pseudo-terminal'
+assert_equal deploy@app "${SSH_ARGS[1]}" 'ssh receives the OpenSSH destination'
+# The fake remote shell, not this test process, expands these variables.
+# shellcheck disable=SC2016
+REMOTE_INNER='cd -- "$1" && exec "${SHELL:-/bin/sh}" -l'
+EXPECTED_REMOTE="sh -c $(quote_sh "$REMOTE_INNER") sh $(quote_sh "$REMOTE_PATH")"
+assert_equal "$EXPECTED_REMOTE" "${SSH_ARGS[2]}" 'remote command preserves spaces and apostrophe'
+assert_equal deploy@app "$("$TMUX" show-options -qv -t '=remote:' @atelier_destination)" 'remote destination is stored in tmux'
+
+"$CLI" window remote
+PANE=$("$TMUX" display-message -p -t '=remote:1' '#{pane_id}')
+"$CLI" split horizontal "$PANE"
+sleep 0.1
+mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
+assert_equal 9 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through ssh'
+
+"$ROOT/tmux-atelier.tmux"
+assert_equal C-a "$("$TMUX" show-options -gv prefix)" 'HERDR prefix is configured'
+assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'remote@app' 'workspace line includes remote destination'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'project@local' 'stopped workspace remains in status'
+assert_contains "$("$TMUX" show-options -gv 'status-format[1]')" 'range=window' 'window line is clickable'
+"$TMUX" list-keys -T prefix | grep -F 'split vertical' >/dev/null || fail 'HERDR vertical split is bound'
+pass 'HERDR vertical split is bound'
+"$TMUX" list-keys -T prefix | grep -F 'popup-new' >/dev/null || fail 'workspace creation popup is bound'
+pass 'workspace creation popup is bound'
+"$TMUX" list-keys -T root | grep -F 'MouseDown1Status' >/dev/null || fail 'left status click is bound'
+pass 'left status click is bound'
+"$TMUX" list-keys -T root | grep -F 'status-menu' >/dev/null || fail 'right workspace click is bound'
+pass 'right workspace click is bound'
+"$TMUX" show-hooks -g session-created | grep -F 'refresh-status' >/dev/null || fail 'session hook refreshes status'
+pass 'session hook refreshes status'
+
+TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
+TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
+    "$CLI" status-click new
+mapfile -d '' -t POPUP_ARGS < "$COMMAND_LOG"
+assert_equal display-popup "${POPUP_ARGS[0]}" 'status plus opens a tmux popup'
+assert_contains "${POPUP_ARGS[6]}" 'popup-new' 'status plus runs the creation form inside the popup'
+
+"$TMUX" new-window -d -t '=remote:' 'sleep 120'
+assert_equal 3 "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
+"$TMUX" display-message -p -t '=remote:' '#{session_name}' >/dev/null || fail 'existing session remains inspectable without invoking scripts'
+pass 'existing session remains inspectable without invoking scripts'
+
+printf '1..%d\n' "$TESTS"

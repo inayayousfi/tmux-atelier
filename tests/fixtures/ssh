@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+: "${TMUX_ATELIER_SSH_LOG:?}"
+printf '%s\0' "$@" >> "$TMUX_ATELIER_SSH_LOG"
+exec sleep 120
