@@ -502,6 +502,7 @@ restore_snapshot_data() {
 }
 
 command_restore_discard() {
+    debug_log 'restore discarded; starting fresh'
     rm -f "$RESTORE_FILE"
     tmux_cmd set-option -gq @atelier_restore_pending 0
     tmux_cmd set-option -gq @atelier_restore_handled 1
@@ -520,10 +521,12 @@ command_restore() {
     local client=${1:-} metadata active created_file status
     [[ -f $RESTORE_FILE ]] || return 0
     if ! metadata=$(validate_snapshot); then
+        debug_log 'restore rejected invalid snapshot'
         command_restore_discard
         die 'invalid restore snapshot'
     fi
     IFS=$'\t' read -r active _ <<< "$metadata"
+    debug_log "restore started client=$client active=$active"
     created_file=$(mktemp "$STATE_ROOT/.restore-created.XXXXXX") || return 1
     tmux_cmd set-option -gq @atelier_restore_pending 1
     tmux_cmd set-option -gq @atelier_restore_handled 0
@@ -540,6 +543,7 @@ command_restore() {
     if ((status != 0)); then
         tmux_cmd set-option -gq @atelier_restore_pending 1
         tmux_cmd set-option -gq @atelier_restore_handled 0
+        debug_log 'restore failed; created sessions rolled back and retry enabled'
         die 'workspace restoration failed'
     fi
     tmux_cmd set-option -gq @atelier_restore_pending 0
@@ -549,6 +553,7 @@ command_restore() {
     if [[ -n $client && -n $active ]] && session_exists "$active"; then
         tmux_cmd switch-client -c "$client" -t "=$active"
     fi
+    debug_log "restore completed client=$client active=$active"
 }
 
 command_popup_restore() {
@@ -560,10 +565,12 @@ command_popup_restore() {
         "$workspaces" "$windows" "$panes"
     if read -r -n 1 choice && [[ $choice == y || $choice == Y ]]; then
         printf '\n'
+        debug_log "restore prompt accepted client=$client workspaces=$workspaces tabs=$windows panes=$panes"
         trap - EXIT
         command_restore "$client"
     else
         printf '\nStarting fresh.\n'
+        debug_log "restore prompt declined client=$client workspaces=$workspaces tabs=$windows panes=$panes"
         trap - EXIT
         command_restore_discard
     fi
@@ -572,11 +579,15 @@ command_popup_restore() {
 command_restore_arm() {
     local handled session
     handled=$(tmux_cmd show-options -gqv @atelier_restore_handled 2>/dev/null || true)
-    [[ -z $handled ]] || return 0
+    if [[ -n $handled ]]; then
+        debug_log "restore arm skipped handled=$handled"
+        return 0
+    fi
     while IFS= read -r session; do
         if [[ -n $session && $(session_option "$session" @atelier_managed) == 1 ]]; then
             tmux_cmd set-option -gq @atelier_restore_handled 1
             tmux_cmd set-option -gq @atelier_restore_pending 0
+            debug_log "restore arm found live managed session=$session"
             command_snapshot
             return 0
         fi
@@ -584,19 +595,25 @@ command_restore_arm() {
     if [[ -f $RESTORE_FILE ]]; then
         tmux_cmd set-option -gq @atelier_restore_handled 0
         tmux_cmd set-option -gq @atelier_restore_pending 1
+        debug_log 'restore armed from saved snapshot'
     else
         tmux_cmd set-option -gq @atelier_restore_handled 1
         tmux_cmd set-option -gq @atelier_restore_pending 0
+        debug_log 'restore arm found no saved snapshot'
     fi
 }
 
 command_restore_start() {
     local client=${1:-} mode handled cli qcli command
     handled=$(tmux_cmd show-options -gqv @atelier_restore_handled 2>/dev/null || true)
-    [[ $handled == 0 ]] || return 0
+    if [[ $handled != 0 ]]; then
+        debug_log "restore start skipped client=$client handled=$handled"
+        return 0
+    fi
     [[ -f $RESTORE_FILE ]] || { command_restore_discard; return; }
     mode=$(tmux_cmd show-options -gqv @atelier_restore 2>/dev/null || true)
     mode=${mode:-prompt}
+    debug_log "restore start client=$client mode=$mode"
     [[ $mode == always || $mode == never || $mode == prompt ]] ||
         die 'invalid @atelier_restore value: expected always, never, or prompt'
     case $mode in

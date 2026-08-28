@@ -24,12 +24,15 @@ set_default_option @atelier_workspace_live_style bold
 set_default_option @atelier_workspace_stopped_style dim
 set_default_option @atelier_add_style bold
 set_default_option @atelier_separator '│'
+set_default_option @atelier_tab_separator '│'
 set_default_option @atelier_restore prompt
 
 TAB_STYLE=$(tmux show-options -gqv @atelier_tab_style)
 TAB_ACTIVE_STYLE=$(tmux show-options -gqv @atelier_tab_active_style)
 ADD_STYLE=$(tmux show-options -gqv @atelier_add_style)
-TABS_FORMAT="#[align=left]#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default] ,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default] }#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
+TAB_SEPARATOR=$(tmux show-options -gqv @atelier_tab_separator)
+TAB_SEPARATOR=${TAB_SEPARATOR//#/##}
+TABS_FORMAT="#[align=left]#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default]$TAB_SEPARATOR,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default]$TAB_SEPARATOR}#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
 CLICK_COMMAND="run-shell -b \"exec $QCLI status-click \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\" \\\"#{session_name}\\\"\""
 MENU_COMMAND="run-shell -b \"exec $QCLI status-menu \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\"\""
 REFRESH_COMMAND="run-shell -b \"$QCLI refresh-status\""
@@ -52,6 +55,29 @@ tmux bind-key -n MouseDown1Status if-shell -F '#{==:#{mouse_status_range},window
 tmux bind-key -n MouseDown3Status if-shell -F '#{m:a*,#{mouse_status_range}}' \
     "$MENU_COMMAND" \
     "$TAB_MENU"
+
+# Replace existing native actions without choosing or changing their keys.
+while IFS= read -r binding; do
+    [[ $binding =~ ^bind-key[[:space:]]+(-r[[:space:]]+)?-T[[:space:]]+prefix[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]] || continue
+    key=${BASH_REMATCH[2]#\\}
+    action=${BASH_REMATCH[3]}
+    if [[ $action == new-window* || $action == *"$CLI"*' window '* ]]; then
+        tmux bind-key "$key" run-shell -b "exec $QCLI window \"#{session_name}\""
+    elif [[ $action == 'split-window -h'* || $action == *"$CLI"*' split vertical '* ]]; then
+        tmux bind-key "$key" run-shell -b "exec $QCLI split vertical \"#{pane_id}\""
+    elif [[ $action == split-window* || $action == *"$CLI"*' split horizontal '* ]]; then
+        tmux bind-key "$key" run-shell -b "exec $QCLI split horizontal \"#{pane_id}\""
+    elif [[ $action == command-prompt* && $action == *' rename-window '* ]] ||
+        [[ $action == *"$CLI"*' request-tab-rename '* ]]; then
+        tmux bind-key "$key" run-shell -b "exec $QCLI request-tab-rename \"#{window_id}\" \"#{client_name}\""
+    elif [[ $action == confirm-before* && $action == *kill-window* ]] ||
+        [[ $action == *"$CLI"*' request-tab-close '* ]]; then
+        tmux bind-key "$key" run-shell -b "exec $QCLI request-tab-close \"#{window_id}\" \"#{client_name}\""
+    elif [[ $action == command-prompt* && $action == *' rename-session '* ]] ||
+        [[ $action == *"$CLI"*' request-rename '* ]]; then
+        tmux bind-key "$key" run-shell -b "exec $QCLI request-rename \"#{session_name}\" \"#{client_name}\""
+    fi
+done < <(tmux list-keys -T prefix)
 
 "$CLI" restore-arm
 

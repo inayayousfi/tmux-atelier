@@ -18,7 +18,7 @@ run-shell /path/to/tmux-atelier/tmux-atelier.tmux
 
 Reload the configuration or restart the tmux server. The plugin enables mouse support and installs its two-line workspace interface, but preserves the existing prefix, status-bar position, colors, and key bindings.
 
-For the complete HERDR setup, copy the relevant settings from `.tmux.conf.example` instead. The example sets `Ctrl-a` as the prefix, places the status bar at the bottom, defines a color theme and key bindings, and loads the plugin. It is documentation only and is never loaded automatically.
+`.tmux.conf.example` shows the supported plugin options and loads the plugin. It does not change the prefix, status-bar position, or theme, and it is never loaded automatically.
 
 ## Targets
 
@@ -98,26 +98,24 @@ The first status line shows the windows in the active session and ends with a `+
 
 The second status line shows saved workspaces and native tmux sessions in creation order. By default, the current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens an FZF menu for renaming, closing, or deleting its saved definition. Right-clicking a tab opens an FZF menu for renaming or closing it. Destructive actions require confirmation.
 
-Set `@atelier_workspace_active_style`, `@atelier_workspace_live_style`, `@atelier_workspace_stopped_style`, `@atelier_tab_style`, `@atelier_tab_active_style`, and `@atelier_add_style` before loading the plugin to customize those elements. `.tmux.conf.example` shows one complete theme.
+Set `@atelier_separator` and `@atelier_tab_separator` before loading the plugin to change the workspace and tab separators. Advanced tmux styles are available through `@atelier_workspace_active_style`, `@atelier_workspace_live_style`, `@atelier_workspace_stopped_style`, `@atelier_tab_style`, `@atelier_tab_active_style`, and `@atelier_add_style`.
 
 The creation popup uses one machine list containing the local machine, concrete SSH aliases found through `Host` and `Include` directives in `~/.ssh/config`, and a custom SSH destination. Aliases show the user, hostname, and port resolved by `ssh -G`; custom destinations accept an alias or `user@host`.
 
 After choosing a machine, the directory browser starts at its home directory. It can select the current directory, descend into normal or hidden directories, follow directory symlinks, move up to `/`, or return to the machine screen. Typing a relative, `~/...`, or absolute path directly into the FZF prompt creates missing directories recursively and selects the resulting path. Remote directories are created and checked through SSH. The final prompt proposes a workspace name derived from the selected directory and allows editing it.
 
-The optional key bindings in `.tmux.conf.example` follow HERDR while preserving tmux's native workspace tree on `Ctrl-a w`:
+tmux-atelier finds the keys currently assigned to native window, split, and rename actions, then replaces only their commands with workspace-aware equivalents. It does not choose the keys. With tmux's default key table, the result is:
 
 ```text
-Ctrl-a w    open the native tmux workspace tree
-Ctrl-a n    create a workspace
-Ctrl-a t    create a tab on the same target
-Ctrl-a r    reload tmux-atelier
-Ctrl-a =    create a vertical split on the same target
-Ctrl-a -    create a horizontal split on the same target
-Ctrl-a h    select the pane on the left
-Ctrl-a j    select the pane below
-Ctrl-a k    select the pane above
-Ctrl-a l    select the pane on the right
+c    create a tab on the workspace target
+%    split the current pane left and right on the same target
+"    split the current pane top and bottom on the same target
+,    rename the current tab
+&    close the current tab and update the restore snapshot
+$    rename the current workspace and its saved definition
 ```
+
+Custom keys already assigned to these native actions are reused in the same way. The plugin does not change the prefix or navigation keys. Commands without a tmux-atelier equivalent, including the native chooser on `w`, retain their normal tmux behavior.
 
 Tab and split commands read their target from tmux session options. A session created without tmux-atelier keeps native tmux behavior.
 
@@ -148,7 +146,7 @@ Restoration starts new shells. It does not restore running processes, shell hist
 
 Running processes belong to tmux and OpenSSH, not tmux-atelier. Removing the repository or breaking a script does not stop existing panes.
 
-Native commands remain available through the configured tmux prefix followed by `:`. With `.tmux.conf.example`, that is `Ctrl-a :`. Useful recovery commands include:
+Native commands remain available through the configured tmux prefix followed by `:`. Useful recovery commands include:
 
 ```sh
 tmux ls

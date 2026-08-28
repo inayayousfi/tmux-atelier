@@ -244,7 +244,10 @@ assert_equal 27 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through s
 "$TMUX" set-option -g prefix C-Space
 "$TMUX" set-option -g status-position top
 "$TMUX" set-option -g @atelier_workspace_active_style underscore
+"$TMUX" set-option -g @atelier_tab_separator '::'
 "$TMUX" bind-key x display-message user-binding
+"$TMUX" unbind-key c
+"$TMUX" bind-key C-n new-window
 "$ROOT/tmux-atelier.tmux"
 assert_equal C-Space "$("$TMUX" show-options -gv prefix)" 'portable UI preserves the existing prefix'
 assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
@@ -253,53 +256,40 @@ assert_equal on "$("$TMUX" show-options -gv mouse)" 'portable UI enables mouse i
 assert_equal prompt "$("$TMUX" show-options -gqv @atelier_restore)" 'portable UI defaults to prompted restoration'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +x ')" 'user-binding' 'portable UI preserves user key bindings'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'underscore' 'portable UI reads configurable workspace styles'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" '::' 'portable UI reads the configurable tab separator'
 
 EXAMPLE_CONFIG="$TEST_ROOT/tmux.conf.example"
 EXAMPLE_CONTENT=$(< "$ROOT/.tmux.conf.example")
 EXAMPLE_CONTENT=${EXAMPLE_CONTENT//\/path\/to\/tmux-atelier/$ROOT}
 printf '%s\n' "$EXAMPLE_CONTENT" > "$EXAMPLE_CONFIG"
 "$TMUX" source-file "$EXAMPLE_CONFIG"
-assert_equal C-a "$("$TMUX" show-options -gv prefix)" 'example config sets the HERDR prefix'
-assert_equal bottom "$("$TMUX" show-options -gv status-position)" 'example config places the status bar at the bottom'
+assert_equal C-Space "$("$TMUX" show-options -gv prefix)" 'example config preserves the existing prefix'
+assert_equal top "$("$TMUX" show-options -gv status-position)" 'example config preserves the status position'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'remote@app' 'workspace line includes remote destination'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'project@local' 'stopped workspace remains in status'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=window' 'window line is clickable'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=user|new-tab' 'tab line has a new-tab button'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" '│' 'example config sets the tab separator'
 WINDOW_LINE=$("$TMUX" display-message -p -t '=remote:' "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')")
 FIRST_WINDOW=$("$TMUX" display-message -p -t '=remote:0' '#{window_index} #{window_name}')
 assert_contains "$WINDOW_LINE" "$FIRST_WINDOW" 'window line renders the first tab'
-assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +w ')" 'choose-tree' 'example keeps the native tmux chooser on prefix+w'
+assert_contains "$WINDOW_LINE" '│' 'window line renders separators between tabs'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +w ')" 'choose-tree' 'portable UI keeps the native tmux chooser'
+ATELIER_BINDINGS=$("$TMUX" list-keys -T prefix | grep -F "$ROOT/bin/tmux-atelier")
+assert_contains "$ATELIER_BINDINGS" 'prefix C-n' 'plugin discovers a customized native new-window key'
+assert_not_contains "$ATELIER_BINDINGS" 'prefix c ' 'plugin does not hardcode the default new-window key'
+assert_contains "$ATELIER_BINDINGS" 'prefix \%' 'plugin reuses the native side-by-side split key'
+assert_contains "$ATELIER_BINDINGS" 'prefix \"' 'plugin reuses the native top-and-bottom split key'
+assert_contains "$ATELIER_BINDINGS" 'prefix ,' 'plugin reuses the native tab rename key'
+assert_contains "$ATELIER_BINDINGS" 'prefix &' 'plugin reuses the native tab close key'
+assert_contains "$ATELIER_BINDINGS" 'prefix \$' 'plugin reuses the native session rename key'
+assert_contains "$ATELIER_BINDINGS" ' window ' 'native new-window key uses the workspace target'
+assert_contains "$ATELIER_BINDINGS" 'split vertical' 'native side-by-side split key uses the workspace target'
+assert_contains "$ATELIER_BINDINGS" 'split horizontal' 'native top-and-bottom split key uses the workspace target'
+assert_contains "$ATELIER_BINDINGS" 'request-tab-rename' 'native tab rename key uses tmux-atelier'
+assert_contains "$ATELIER_BINDINGS" 'request-tab-close' 'native tab close key updates the snapshot'
+assert_contains "$ATELIER_BINDINGS" 'request-rename' 'native session rename key updates the saved workspace'
 assert_contains "$("$TMUX" show-hooks -g client-attached)" 'restore-start' 'client attachment checks for a saved topology'
-VERTICAL_BINDING=$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +=')
-assert_contains "$VERTICAL_BINDING" 'split' 'HERDR vertical split invokes tmux-atelier'
-assert_contains "$VERTICAL_BINDING" 'vertical' 'HERDR equals key requests a vertical split'
-sleep 10 | env -u TMUX "$TMUX" -C attach-session -t '=remote' > "$TEST_ROOT/control-client.log" 2>&1 &
-CONTROL_PID=$!
-CONTROL_CLIENT=
-for _ in {1..10}; do
-    CONTROL_CLIENT=$("$TMUX" list-clients -F '#{client_name}' 2>/dev/null || true)
-    [[ -n $CONTROL_CLIENT ]] && break
-    sleep 0.1
-done
-[[ -n $CONTROL_CLIENT ]] || fail "control client starts for key binding test: $(< "$TEST_ROOT/control-client.log")"
-PANES_BEFORE=$("$TMUX" list-panes -a -F '#{pane_id}' | wc -l)
-"$TMUX" send-keys -K -c "$CONTROL_CLIENT" C-a =
-for _ in {1..10}; do
-    PANES_AFTER=$("$TMUX" list-panes -a -F '#{pane_id}' | wc -l)
-    ((PANES_AFTER == PANES_BEFORE + 1)) && break
-    sleep 0.1
-done
-assert_equal "$((PANES_BEFORE + 1))" "$PANES_AFTER" 'HERDR equals binding creates a pane without opening buffers'
-"$TMUX" detach-client -t "$CONTROL_CLIENT"
-wait "$CONTROL_PID" 2>/dev/null || true
-assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +h ')" 'select-pane -L' 'vim h selects the pane on the left'
-assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +j ')" 'select-pane -D' 'vim j selects the pane below'
-assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +k ')" 'select-pane -U' 'vim k selects the pane above'
-assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +-r +-T prefix +l ')" 'select-pane -R' 'vim l selects the pane on the right'
-"$TMUX" list-keys -T prefix | grep -F 'popup-new' >/dev/null || fail 'workspace creation popup is bound'
-pass 'workspace creation popup is bound'
-RELOAD_BINDING=$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +r ')
-assert_contains "$RELOAD_BINDING" 'tmux-atelier.tmux' 'HERDR r reloads tmux-atelier'
 "$TMUX" list-keys -T root | grep -F 'MouseDown1Status' >/dev/null || fail 'left status click is bound'
 pass 'left status click is bound'
 "$TMUX" list-keys -T root | grep -F 'status-menu' >/dev/null || fail 'right workspace click is bound'
