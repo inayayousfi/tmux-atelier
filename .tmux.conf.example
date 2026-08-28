@@ -1,0 +1,31 @@
+# Example tmux-atelier preferences. Copy or adapt these settings in ~/.tmux.conf.
+# Replace /path/to/tmux-atelier with the absolute path to this repository.
+
+set-option -g prefix C-a
+unbind-key C-b
+bind-key C-a send-prefix
+
+set-option -g status-position bottom
+set-option -g status-style default
+set-option -g @atelier_tab_style default
+set-option -g @atelier_tab_active_style reverse
+set-option -g @atelier_workspace_active_style reverse
+set-option -g @atelier_workspace_live_style bold
+set-option -g @atelier_workspace_stopped_style dim
+set-option -g @atelier_add_style bold
+set-option -g @atelier_separator '│'
+
+run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+
+# Prefix+w keeps tmux's native session and window chooser.
+bind-key n display-popup -c '#{client_name}' -e 'TMUX_ATELIER_CLIENT=#{client_name}' \
+    -E -w '70%' -h '60%' '/path/to/tmux-atelier/bin/tmux-atelier popup-new'
+bind-key t run-shell -b 'exec /path/to/tmux-atelier/bin/tmux-atelier window "#{session_name}"'
+bind-key r run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+unbind-key +
+bind-key = run-shell -b 'exec /path/to/tmux-atelier/bin/tmux-atelier split vertical "#{pane_id}"'
+bind-key - run-shell -b 'exec /path/to/tmux-atelier/bin/tmux-atelier split horizontal "#{pane_id}"'
+bind-key -r h select-pane -L
+bind-key -r j select-pane -D
+bind-key -r k select-pane -U
+bind-key -r l select-pane -R

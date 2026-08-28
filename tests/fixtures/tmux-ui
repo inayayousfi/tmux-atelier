@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+case ${1:-} in
+    show-options)
+        printf '%s\n' "${TMUX_ATELIER_CLI_FOR_TEST:?}"
+        ;;
+    has-session)
+        exit 0
+        ;;
+    display-message)
+        printf 'editor\n'
+        ;;
+    list-sessions)
+        printf 'workspace\n'
+        ;;
+    *)
+        printf 'unexpected tmux command: %s\n' "$*" >&2
+        exit 1
+        ;;
+esac

@@ -10,6 +10,7 @@ readonly DEBUG_LOG="${TMUX_ATELIER_DEBUG_LOG:-$STATE_ROOT/debug.log}"
 WORKSPACE_NAME=
 WORKSPACE_DESTINATION=
 WORKSPACE_PATH=
+WORKSPACE_CREATED=
 declare -A SSH_CONFIG_SEEN=()
 declare -a SSH_COMMON_ARGS=()
 
@@ -55,7 +56,7 @@ workspace_file() {
 
 read_workspace() {
     local name=$1 file key value
-    local seen_name=0 seen_destination=0 seen_path=0
+    local seen_name=0 seen_destination=0 seen_path=0 seen_created=0
 
     file=$(workspace_file "$name")
     [[ -f $file ]] || die "workspace not found: $name"
@@ -63,6 +64,7 @@ read_workspace() {
     WORKSPACE_NAME=
     WORKSPACE_DESTINATION=
     WORKSPACE_PATH=
+    WORKSPACE_CREATED=
     while IFS='=' read -r key value || [[ -n $key ]]; do
         case $key in
             name)
@@ -80,6 +82,11 @@ read_workspace() {
                 WORKSPACE_PATH=$value
                 seen_path=1
                 ;;
+            created)
+                ((seen_created == 0)) || die "duplicate creation time in workspace: $name"
+                WORKSPACE_CREATED=$value
+                seen_created=1
+                ;;
             ''|'#'*) ;;
         esac
     done < "$file"
@@ -89,20 +96,29 @@ read_workspace() {
     validate_name "$WORKSPACE_NAME"
     validate_destination "$WORKSPACE_DESTINATION"
     validate_value path "$WORKSPACE_PATH"
+    if ((seen_created)); then
+        [[ $WORKSPACE_CREATED =~ ^[0-9]+([.][0-9]+)?$ ]] ||
+            die "invalid creation time in workspace: $name"
+    else
+        WORKSPACE_CREATED=$(stat -c '%Y' "$file")
+    fi
 }
 
 write_workspace() {
-    local name=$1 destination=$2 path=$3 mode=${4:-replace} file temporary
+    local name=$1 destination=$2 path=$3 mode=${4:-replace} created=${5:-} file temporary
     validate_name "$name"
     validate_destination "$destination"
     validate_value path "$path"
+    [[ -n $created ]] || created=$(date +%s.%N)
+    [[ $created =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid creation time: $created"
 
     mkdir -p "$WORKSPACES_DIR" || return 1
     chmod 700 "$WORKSPACES_DIR" || return 1
     file=$(workspace_file "$name")
     temporary=$(mktemp "$WORKSPACES_DIR/.${name}.XXXXXX") || return 1
     chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
-    if ! printf 'name=%s\ndestination=%s\npath=%s\n' "$name" "$destination" "$path" > "$temporary"; then
+    if ! printf 'name=%s\ndestination=%s\npath=%s\ncreated=%s\n' \
+        "$name" "$destination" "$path" "$created" > "$temporary"; then
         rm -f "$temporary"
         return 1
     fi
@@ -280,16 +296,16 @@ command_window() {
     local session=${1:-} destination path command
     [[ -n $session ]] || session=$(current_session)
     if [[ $(session_option "$session" @atelier_managed) != 1 ]]; then
-        tmux_cmd new-window -t "=$session:"
+        tmux_cmd new-window -a -t "=$session:{end}"
         return
     fi
     destination=$(session_option "$session" @atelier_destination)
     path=$(session_option "$session" @atelier_path)
     if [[ $destination == local ]]; then
-        tmux_cmd new-window -t "=$session:" -c "$path"
+        tmux_cmd new-window -a -t "=$session:{end}" -c "$path"
     else
         command=$(remote_shell_command "$destination" "$path")
-        tmux_cmd new-window -t "=$session:" "$command"
+        tmux_cmd new-window -a -t "=$session:{end}" "$command"
     fi
 }
 
@@ -329,7 +345,20 @@ session_names() {
 }
 
 all_names() {
-    { definition_names; session_names; } | LC_ALL=C sort -u
+    local name created
+    while IFS=$'\t' read -r created name; do
+        [[ -n $name ]] && printf '%s\n' "$name"
+    done < <({
+        while IFS= read -r name; do
+            [[ -n $name ]] || continue
+            read_workspace "$name"
+            created=$WORKSPACE_CREATED
+            printf '%s\t%s\n' "$created" "$name"
+        done < <(definition_names)
+        while IFS=$'\t' read -r created name; do
+            [[ -n $name && ! -f $WORKSPACES_DIR/$name ]] && printf '%s\t%s\n' "$created" "$name"
+        done < <(tmux_cmd list-sessions -F $'#{session_created}\t#{session_name}' 2>/dev/null || true)
+    } | LC_ALL=C sort -t $'\t' -k1,1n -k2,2)
 }
 
 escape_format() {
@@ -372,22 +401,33 @@ workspace_label() {
 
 status_line_for() {
     local active=$1 name token label style line='' index=0
+    local active_style live_style stopped_style add_style separator
+    active_style=$(tmux_cmd show-options -gqv @atelier_workspace_active_style)
+    live_style=$(tmux_cmd show-options -gqv @atelier_workspace_live_style)
+    stopped_style=$(tmux_cmd show-options -gqv @atelier_workspace_stopped_style)
+    add_style=$(tmux_cmd show-options -gqv @atelier_add_style)
+    separator=$(escape_format "$(tmux_cmd show-options -gqv @atelier_separator)")
+    active_style=${active_style:-reverse}
+    live_style=${live_style:-bold}
+    stopped_style=${stopped_style:-dim}
+    add_style=${add_style:-bold}
+    separator=${separator:-│}
     while IFS= read -r name; do
         [[ -n $name ]] || continue
         token="a$index"
         tmux_cmd set-option -gq "@atelier_range_$token" "$name"
         label=$(escape_format "$(workspace_label "$name")")
         if [[ $name == "$active" ]]; then
-            style='reverse'
+            style=$active_style
         elif session_exists "$name"; then
-            style='bold'
+            style=$live_style
         else
-            style='dim'
+            style=$stopped_style
         fi
-        line+="#[range=user|$token,$style] $label #[default,norange]│"
+        line+="#[range=user|$token,$style] $label #[default,norange]$separator"
         ((++index))
     done < <(all_names)
-    line+="#[range=user|new,bold] + #[default,norange]"
+    line+="#[range=user|new,$add_style] + #[default,norange]"
     printf '%s\n' "$line"
 }
 
@@ -623,7 +663,7 @@ command_request_delete() {
 
 command_rename() {
     local old=${1:-} new=${2:-} old_file new_file session_renamed=0
-    local destination='' path=''
+    local destination='' path='' created=''
     validate_name "$old"
     validate_name "$new"
     [[ $old != "$new" ]] || return 0
@@ -637,6 +677,7 @@ command_rename() {
         read_workspace "$old"
         destination=$WORKSPACE_DESTINATION
         path=$WORKSPACE_PATH
+        created=$WORKSPACE_CREATED
     fi
 
     if session_exists "$old"; then
@@ -644,7 +685,7 @@ command_rename() {
         session_renamed=1
     fi
     if [[ -f $old_file ]]; then
-        if ! write_workspace "$new" "$destination" "$path" create; then
+        if ! write_workspace "$new" "$destination" "$path" create "$created"; then
             ((session_renamed)) && tmux_cmd rename-session -t "=$new" "$old" || true
             die "could not rename workspace: $old"
         fi
@@ -662,7 +703,7 @@ command_edit() {
     parse_target "$target"
     [[ $WORKSPACE_DESTINATION != local || -d $WORKSPACE_PATH ]] ||
         die "local path is not a directory: $WORKSPACE_PATH"
-    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" ||
+    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" replace "$WORKSPACE_CREATED" ||
         die "could not update workspace: $name"
     refresh_status_if_running
 }
@@ -938,80 +979,6 @@ command_popup_new() {
     done
 }
 
-workspace_choices() {
-    local name pane
-    while IFS= read -r name; do
-        [[ -n $name ]] || continue
-        pane=
-        if session_exists "$name"; then
-            pane=$(tmux_cmd display-message -p -t "=$name:" '#{pane_id}')
-        fi
-        printf '%s\t%s\n' "$name" "$pane"
-    done < <(all_names)
-}
-
-command_preview_pane() {
-    local pane=${1:-}
-    if [[ -z $pane ]]; then
-        printf 'No live terminal for this selection.\n'
-        return
-    fi
-    tmux_cmd capture-pane -p -S -200 -t "$pane" 2>/dev/null ||
-        printf 'The selected terminal is no longer available.\n'
-}
-
-command_picker() {
-    local client=${1:-${TMUX_ATELIER_CLIENT:-}} cli qcli preview name_choice name
-    local window_choice window_index pane_choice pane_id
-    cli=$(cli_path)
-    qcli=$(quote_sh "$cli")
-    preview="$qcli preview-pane {2}"
-
-    while true; do
-        name_choice=$(workspace_choices |
-            fzf --delimiter=$'\t' --with-nth=1 --prompt='Workspace > ' \
-                --preview="$preview" --preview-window='right,60%,border-left' \
-                --height=100% --border) || return 0
-        name=${name_choice%%$'\t'*}
-        [[ -n $name ]] || return 0
-        session_exists "$name" || command_open "$name" --detached
-
-        while true; do
-            window_choice=$({
-                tmux_cmd list-windows -t "=$name:" \
-                    -F $'#{window_index}\t#{window_name}\t#{window_panes} panes\t#{pane_id}'
-                printf '< Back\t\t\t\n'
-            } | fzf --delimiter=$'\t' --with-nth=1,2,3 --prompt='Tab > ' \
-                --preview="$qcli preview-pane {4}" --preview-window='right,60%,border-left' \
-                --height=100% --border) || return 0
-            [[ ${window_choice%%$'\t'*} == '< Back' ]] && break
-            window_index=${window_choice%%$'\t'*}
-            [[ -n $window_index ]] || return 0
-
-            while true; do
-                pane_choice=$({
-                    tmux_cmd list-panes -t "=$name:$window_index" \
-                        -F $'#{pane_index}: #{pane_current_command}  #{pane_current_path}\t#{pane_id}'
-                    printf '< Back\t\n'
-                } | fzf --delimiter=$'\t' --with-nth=1 --prompt='Split > ' \
-                    --preview="$preview" --preview-window='right,60%,border-left' \
-                    --height=100% --border) || return 0
-                [[ ${pane_choice%%$'\t'*} == '< Back' ]] && break
-                pane_id=${pane_choice#*$'\t'}
-                [[ -n $pane_id ]] || return 0
-
-                tmux_cmd select-pane -t "$pane_id"
-                if [[ -n $client ]]; then
-                    tmux_cmd switch-client -c "$client" -t "=$name:$window_index"
-                else
-                    tmux_cmd switch-client -t "=$name:$window_index"
-                fi
-                return
-            done
-        done
-    done
-}
-
 command_popup_rename() {
     local old=${1:-} new
     validate_name "$old"
@@ -1047,8 +1014,6 @@ Commands:
   edit NAME TARGET
   close NAME
   delete NAME
-  picker
-  preview-pane [PANE]
   popup-new
   popup-workspace-menu NAME
   popup-tab-menu WINDOW_ID
@@ -1069,8 +1034,6 @@ main() {
         edit) (($# == 2)) || die 'usage: tmux-atelier edit name destination:path'; command_edit "$@" ;;
         close) (($# == 1)) || die 'usage: tmux-atelier close name'; command_close "$@" ;;
         delete) (($# == 1)) || die 'usage: tmux-atelier delete name'; command_delete "$@" ;;
-        picker) (($# <= 1)) || die 'usage: tmux-atelier picker [client]'; command_picker "$@" ;;
-        preview-pane) (($# <= 1)) || die 'usage: tmux-atelier preview-pane [pane]'; command_preview_pane "$@" ;;
         popup-new) (($# == 0)) || die 'usage: tmux-atelier popup-new'; command_popup_new ;;
         popup-workspace-menu) (($# == 1)) || die 'usage: tmux-atelier popup-workspace-menu name'; command_popup_workspace_menu "$@" ;;
         popup-tab-menu) (($# == 1)) || die 'usage: tmux-atelier popup-tab-menu window-id'; command_popup_tab_menu "$@" ;;

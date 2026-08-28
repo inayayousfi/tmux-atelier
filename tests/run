@@ -11,9 +11,6 @@ LOCAL_ONE="$TEST_ROOT/local one=ok"
 LOCAL_TWO="$TEST_ROOT/local two"
 SSH_LOG="$TEST_ROOT/ssh.log"
 COMMAND_LOG="$TEST_ROOT/tmux-command.log"
-FZF_LOG="$TEST_ROOT/fzf.log"
-FZF_INPUT_LOG="$TEST_ROOT/fzf-input.log"
-PICKER_LOG="$TEST_ROOT/picker.log"
 WIZARD_HOME="$TEST_ROOT/wizard-home"
 WIZARD_CHOICES="$TEST_ROOT/wizard-choices"
 WIZARD_FZF_LOG="$TEST_ROOT/wizard-fzf.log"
@@ -75,6 +72,20 @@ assert_directory() {
     pass "$2"
 }
 
+stored_value() {
+    local file=$1 wanted=$2 key value
+    while IFS='=' read -r key value; do
+        [[ $key == "$wanted" ]] && { printf '%s\n' "$value"; return; }
+    done < "$file"
+}
+
+assert_order() {
+    local value=$1 first=$2 second=$3 message=$4
+    [[ $value == *"$first"*"$second"* ]] ||
+        fail "$message ('$first' does not precede '$second' in '$value')"
+    pass "$message"
+}
+
 assert_no_file() {
     [[ ! -e $1 ]] || fail "$2"
     pass "$2"
@@ -109,6 +120,9 @@ chmod +x "$TEST_BIN/tmux" "$TEST_BIN/ssh"
 assert_file "$STATE_DIR/workspaces/local-one" 'local definition is persisted'
 assert_equal 600 "$(stat -c '%a' "$STATE_DIR/workspaces/local-one")" 'definition permissions are private'
 assert_contains "$(< "$STATE_DIR/workspaces/local-one")" 'path='"$LOCAL_ONE" 'spaces and equals are preserved'
+LOCAL_CREATED=$(stored_value "$STATE_DIR/workspaces/local-one" created)
+[[ -n $LOCAL_CREATED ]] || fail 'new definitions store their creation order'
+pass 'new definitions store their creation order'
 assert_equal local "$("$TMUX" show-options -qv -t '=local-one:' @atelier_destination)" 'local destination is stored in tmux'
 assert_equal "$LOCAL_ONE" "$("$TMUX" display-message -p -t '=local-one:' '#{pane_current_path}')" 'initial local pane uses workspace path'
 
@@ -130,12 +144,14 @@ assert_fails 'live workspace target cannot be edited' "$CLI" edit local-one "loc
 "$CLI" close local-one
 assert_file "$STATE_DIR/workspaces/local-one" 'closing keeps the definition'
 "$CLI" edit local-one "local:$LOCAL_TWO"
+assert_equal "$LOCAL_CREATED" "$(stored_value "$STATE_DIR/workspaces/local-one" created)" 'editing preserves workspace order'
 "$CLI" open local-one --detached
 assert_equal "$LOCAL_TWO" "$("$TMUX" display-message -p -t '=local-one:' '#{pane_current_path}')" 'stopped workspace reopens with edited path'
 
 "$CLI" rename local-one renamed
 assert_no_file "$STATE_DIR/workspaces/local-one" 'rename removes old definition'
 assert_file "$STATE_DIR/workspaces/renamed" 'rename writes new definition'
+assert_equal "$LOCAL_CREATED" "$(stored_value "$STATE_DIR/workspaces/renamed" created)" 'rename preserves workspace order'
 "$TMUX" has-session -t '=renamed' || fail 'rename updates live tmux session'
 pass 'rename updates live tmux session'
 
@@ -162,6 +178,26 @@ mkdir -p "$TEST_ROOT/project"
 "$CLI" new "local:$TEST_ROOT/project" --detached
 "$CLI" close project-2
 assert_file "$STATE_DIR/workspaces/project-2" 'automatic names receive collision suffixes'
+
+printf 'name=legacy-order\ndestination=local\npath=%s\n' "$LOCAL_ONE" \
+    > "$STATE_DIR/workspaces/legacy-order"
+touch -d '@1' "$STATE_DIR/workspaces/legacy-order"
+"$CLI" rename legacy-order legacy-renamed
+assert_equal 1 "$(stored_value "$STATE_DIR/workspaces/legacy-renamed" created)" 'legacy definitions inherit their file date'
+
+"$CLI" new "local:$LOCAL_ONE" z-created --detached
+"$CLI" close z-created
+"$CLI" new "local:$LOCAL_ONE" a-created --detached
+"$CLI" close a-created
+"$CLI" refresh-status
+ORDER_LINE=$("$TMUX" show-options -v -t '=renamed:' 'status-format[1]')
+assert_order "$ORDER_LINE" legacy-renamed z-created 'legacy workspaces retain their initial order'
+assert_order "$ORDER_LINE" z-created a-created 'new workspaces are appended instead of sorted by name'
+Z_CREATED=$(stored_value "$STATE_DIR/workspaces/z-created" created)
+"$CLI" rename z-created z-renamed
+assert_equal "$Z_CREATED" "$(stored_value "$STATE_DIR/workspaces/z-renamed" created)" 'renamed workspace keeps its creation value'
+ORDER_LINE=$("$TMUX" show-options -v -t '=renamed:' 'status-format[1]')
+assert_order "$ORDER_LINE" z-renamed a-created 'renamed workspace keeps its status position'
 
 set +e
 "$CLI" new "local:$LOCAL_ONE" race --detached > "$TEST_ROOT/race-one.log" 2>&1 &
@@ -205,10 +241,25 @@ sleep 0.1
 mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
 assert_equal 27 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through shared ssh'
 
+"$TMUX" set-option -g prefix C-Space
+"$TMUX" set-option -g status-position top
+"$TMUX" set-option -g @atelier_workspace_active_style underscore
+"$TMUX" bind-key x display-message user-binding
 "$ROOT/tmux-atelier.tmux"
-assert_equal C-a "$("$TMUX" show-options -gv prefix)" 'HERDR prefix is configured'
+assert_equal C-Space "$("$TMUX" show-options -gv prefix)" 'portable UI preserves the existing prefix'
 assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
-assert_equal bottom "$("$TMUX" show-options -gv status-position)" 'status bar is at the bottom'
+assert_equal top "$("$TMUX" show-options -gv status-position)" 'portable UI preserves the status position'
+assert_equal on "$("$TMUX" show-options -gv mouse)" 'portable UI enables mouse interactions'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +x ')" 'user-binding' 'portable UI preserves user key bindings'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'underscore' 'portable UI reads configurable workspace styles'
+
+EXAMPLE_CONFIG="$TEST_ROOT/tmux.conf.example"
+EXAMPLE_CONTENT=$(< "$ROOT/.tmux.conf.example")
+EXAMPLE_CONTENT=${EXAMPLE_CONTENT//\/path\/to\/tmux-atelier/$ROOT}
+printf '%s\n' "$EXAMPLE_CONTENT" > "$EXAMPLE_CONFIG"
+"$TMUX" source-file "$EXAMPLE_CONFIG"
+assert_equal C-a "$("$TMUX" show-options -gv prefix)" 'example config sets the HERDR prefix'
+assert_equal bottom "$("$TMUX" show-options -gv status-position)" 'example config places the status bar at the bottom'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'remote@app' 'workspace line includes remote destination'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'project@local' 'stopped workspace remains in status'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=window' 'window line is clickable'
@@ -216,6 +267,7 @@ assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'r
 WINDOW_LINE=$("$TMUX" display-message -p -t '=remote:' "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')")
 FIRST_WINDOW=$("$TMUX" display-message -p -t '=remote:0' '#{window_index} #{window_name}')
 assert_contains "$WINDOW_LINE" "$FIRST_WINDOW" 'window line renders the first tab'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +w ')" 'choose-tree' 'example keeps the native tmux chooser on prefix+w'
 VERTICAL_BINDING=$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +=')
 assert_contains "$VERTICAL_BINDING" 'split' 'HERDR vertical split invokes tmux-atelier'
 assert_contains "$VERTICAL_BINDING" 'vertical' 'HERDR equals key requests a vertical split'
@@ -263,6 +315,7 @@ for _ in {1..10}; do
     sleep 0.2
 done
 assert_contains "$HOOK_STATUS" 'native-after-plugin@tmux' 'session hook executes refresh-status with its argument'
+assert_order "$HOOK_STATUS" a-created native-after-plugin 'new native sessions are appended by creation time'
 
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
@@ -288,35 +341,17 @@ WINDOWS_BEFORE=$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)
 WINDOWS_AFTER=$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)
 assert_equal "$((WINDOWS_BEFORE + 1))" "$WINDOWS_AFTER" 'tab plus creates a window on the current workspace target'
 
-TMUX_ATELIER_STATE_DIR="$TEST_ROOT/picker-state" \
-TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
-TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
-TMUX_ATELIER_FZF_LOG="$FZF_LOG" \
-TMUX_ATELIER_FZF_INPUT_LOG="$FZF_INPUT_LOG" \
-TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" \
-PATH="$ROOT/tests/fixtures:$PATH" \
-    "$CLI" picker test-client
-assert_equal 3 "$(wc -l < "$FZF_LOG")" 'picker opens workspace, tab, and split menus'
-assert_contains "$(< "$FZF_LOG")" 'Workspace > ' 'picker asks for a workspace first'
-assert_contains "$(< "$FZF_LOG")" 'Tab > ' 'picker asks for a tab second'
-assert_contains "$(< "$FZF_LOG")" 'Split > ' 'picker asks for a split last'
-assert_contains "$(< "$FZF_LOG")" 'preview-pane' 'picker configures terminal previews'
-assert_contains "$(< "$FZF_INPUT_LOG")" '< Back' 'tab and split menus offer a back selection'
-mapfile -d '' -t PICKER_ARGS < "$PICKER_LOG"
-assert_equal select-pane "${PICKER_ARGS[0]}" 'picker selects the chosen pane'
-assert_equal '%7' "${PICKER_ARGS[2]}" 'picker keeps the chosen pane id'
-assert_equal switch-client "${PICKER_ARGS[3]}" 'picker switches the originating client'
-assert_equal test-client "${PICKER_ARGS[5]}" 'picker targets the client that opened it'
-assert_equal '=workspace:2' "${PICKER_ARGS[7]}" 'picker opens the chosen workspace tab'
-PREVIEW=$(TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
-    TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" "$CLI" preview-pane '%7')
-assert_equal 'terminal preview' "$PREVIEW" 'picker preview captures the selected terminal'
+"$CLI" new "local:$LOCAL_ONE" tab-order --detached
+"$TMUX" move-window -s '=tab-order:0' -t '=tab-order:1'
+"$CLI" window tab-order
+assert_equal $'1\n2' "$("$TMUX" list-windows -t '=tab-order:' -F '#{window_index}')" 'new tabs append after the highest existing index'
+"$TMUX" kill-session -t '=tab-order'
+"$CLI" delete tab-order
 
 MENU_FZF_LOG="$TEST_ROOT/menu-fzf.log"
 MENU_INPUT_LOG="$TEST_ROOT/menu-input.log"
-TMUX_ATELIER_STATE_DIR="$TEST_ROOT/picker-state" \
-TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
-TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" \
+TMUX_ATELIER_STATE_DIR="$TEST_ROOT/menu-state" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-ui" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
 TMUX_ATELIER_FZF_LOG="$MENU_FZF_LOG" \
 TMUX_ATELIER_FZF_INPUT_LOG="$MENU_INPUT_LOG" \
@@ -328,7 +363,7 @@ assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename workspace' 'workspace FZF menu 
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Close workspace' 'workspace FZF menu offers close'
 
 : > "$COMMAND_LOG"
-TMUX_ATELIER_STATE_DIR="$TEST_ROOT/picker-state" \
+TMUX_ATELIER_STATE_DIR="$TEST_ROOT/menu-state" \
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
 TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
@@ -362,15 +397,14 @@ assert_contains "${TAB_RENAME_PROMPT_ARGS[*]}" 'test-client' 'tab rename popup t
 
 : > "$MENU_FZF_LOG"
 : > "$MENU_INPUT_LOG"
-TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-picker" \
-TMUX_ATELIER_PICKER_LOG="$PICKER_LOG" \
+TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-ui" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
 TMUX_ATELIER_FZF_LOG="$MENU_FZF_LOG" \
 TMUX_ATELIER_FZF_INPUT_LOG="$MENU_INPUT_LOG" \
 TMUX_ATELIER_FZF_CANCEL=1 \
 PATH="$ROOT/tests/fixtures:$PATH" \
     "$CLI" popup-tab-menu '@2'
-assert_contains "$(< "$MENU_FZF_LOG")" '%1 > ' 'tab actions use FZF'
+assert_contains "$(< "$MENU_FZF_LOG")" 'editor > ' 'tab actions use FZF'
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename tab' 'tab FZF menu offers rename'
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Close tab' 'tab FZF menu offers close'
 
