@@ -937,13 +937,13 @@ status_line_for() {
 }
 
 command_refresh_status() {
-    local session line tabs
-    tabs=$(tmux_cmd show-options -gqv @atelier_tabs_format 2>/dev/null || true)
+    local session line status_format
+    status_format=$(tmux_cmd show-options -gqv @atelier_tabs_format 2>/dev/null || true)
     clear_range_options
     while IFS= read -r session; do
         [[ -n $session ]] || continue
         line=$(status_line_for "$session")
-        tmux_cmd set-option -q -t "=$session:" 'status-format[0]' "$tabs"
+        tmux_cmd set-option -q -t "=$session:" 'status-format[0]' "$status_format"
         tmux_cmd set-option -q -t "=$session:" 'status-format[1]' "$line"
     done < <(session_names)
 }

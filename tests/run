@@ -245,11 +245,17 @@ assert_equal 27 "${#SSH_ARGS[@]}" 'remote windows and splits reconnect through s
 
 "$TMUX" set-option -g prefix C-Space
 "$TMUX" set-option -g status-position top
+"$TMUX" set-option -g status-left 'OMT-LEFT'
+"$TMUX" set-option -g status-right 'OMT-RIGHT'
 "$TMUX" set-option -g @atelier_workspace_active_style underscore
 "$TMUX" set-option -g @atelier_tab_separator '::'
 "$TMUX" bind-key x display-message user-binding
+"$TMUX" bind-key e new-window -n config-editor 'sleep 120'
 "$TMUX" unbind-key c
 "$TMUX" bind-key C-n new-window
+"$ROOT/tmux-atelier.tmux"
+assert_not_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'status-left' 'portable UI hides native status sections by default'
+"$TMUX" set-option -g @atelier_status_sides on
 "$ROOT/tmux-atelier.tmux"
 assert_equal C-Space "$("$TMUX" show-options -gv prefix)" 'portable UI preserves the existing prefix'
 assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
@@ -257,8 +263,11 @@ assert_equal top "$("$TMUX" show-options -gv status-position)" 'portable UI pres
 assert_equal on "$("$TMUX" show-options -gv mouse)" 'portable UI enables mouse interactions'
 assert_equal prompt "$("$TMUX" show-options -gqv @atelier_restore)" 'portable UI defaults to prompted restoration'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +x ')" 'user-binding' 'portable UI preserves user key bindings'
+assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +e ')" 'config-editor' 'portable UI preserves specialized new-window bindings'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'underscore' 'portable UI reads configurable workspace styles'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" '::' 'portable UI reads the configurable tab separator'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'status-left' 'portable UI preserves the left status section'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'status-right' 'portable UI preserves the right status section'
 
 EXAMPLE_CONFIG="$TEST_ROOT/tmux.conf.example"
 EXAMPLE_CONTENT=$(< "$ROOT/.tmux.conf.example")
@@ -274,8 +283,12 @@ assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'r
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" '│' 'example config sets the tab separator'
 WINDOW_LINE=$("$TMUX" display-message -p -t '=remote:' "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')")
 FIRST_WINDOW=$("$TMUX" display-message -p -t '=remote:0' '#{window_index} #{window_name}')
+assert_contains "$WINDOW_LINE" 'OMT-LEFT' 'window line renders the configured left status section'
+assert_contains "$WINDOW_LINE" 'OMT-RIGHT' 'window line renders the configured right status section'
 assert_contains "$WINDOW_LINE" "$FIRST_WINDOW" 'window line renders the first tab'
 assert_contains "$WINDOW_LINE" '│' 'window line renders separators between tabs'
+"$CLI" refresh-status
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=window' 'status refresh keeps the tab line populated'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +w ')" 'choose-tree' 'portable UI keeps the native tmux chooser'
 ATELIER_BINDINGS=$("$TMUX" list-keys -T prefix | grep -F "$ROOT/bin/tmux-atelier")
 assert_contains "$ATELIER_BINDINGS" 'prefix C-n' 'plugin discovers a customized native new-window key'

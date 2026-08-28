@@ -10,15 +10,39 @@ Running tmux-atelier requires Bash, tmux, OpenSSH, and fzf. ShellCheck is only n
 
 ## Installation
 
-The repository is self-contained. Add the following line to your tmux configuration, replacing the path with the absolute path to the repository:
+The repository is self-contained. Add the following line as the last active line of your tmux configuration, replacing the path with the absolute path to the repository:
 
 ```tmux
 run-shell /path/to/tmux-atelier/tmux-atelier.tmux
 ```
 
-Reload the configuration or restart the tmux server. The plugin enables mouse support and installs its two-line workspace interface, but preserves the existing prefix, status-bar position, colors, and key bindings.
+It must be loaded last so that tmux-atelier can reuse the final key bindings and status-line sections installed by the rest of the configuration. Reload the configuration or restart the tmux server. The plugin enables mouse support and installs its two-line workspace interface, but preserves the existing prefix, status-bar position, colors, and key bindings.
 
 `.tmux.conf.example` shows the supported plugin options and loads the plugin. It does not change the prefix, status-bar position, or theme, and it is never loaded automatically.
+
+### Oh My Tmux
+
+tmux-atelier can be loaded from an Oh My Tmux `.tmux.conf.local`. Its first line keeps the configured Oh My Tmux `status-left` and `status-right` sections and replaces the central window list with tmux-atelier tabs. The second line contains the workspaces.
+
+Keep the `run-shell` command as the final active tmux command in `.tmux.conf.local`, after theme options, custom bindings, and TPM plugin declarations:
+
+```tmux
+set-option -g @atelier_restore prompt
+set-option -g @atelier_status_sides on
+run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+```
+
+`@atelier_status_sides` is disabled by default so a regular tmux configuration does not show tmux's default session name, pane title, and date around the tabs.
+
+`oh-my-tmux.conf.local.example` is a minimal integration example based on the development configuration: `C-a` is the only prefix, the status bar stays at the bottom, tabs are left aligned, and mouse support is enabled by tmux-atelier. The visible `OMT` label distinguishes the Oh My Tmux status sections from tmux's defaults.
+
+Run the integration without changing the current tmux server or saved workspaces:
+
+```sh
+./tests/oh-my-tmux
+```
+
+The command downloads Oh My Tmux into `.tmp/oh-my-tmux` on its first run, generates a local configuration with the current repository path, and starts a disposable server on the `tmux-atelier-oh-my-tmux` socket. Exit that test session normally to return to the existing tmux session.
 
 ## Targets
 

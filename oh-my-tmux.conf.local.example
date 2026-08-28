@@ -1,0 +1,23 @@
+# Minimal Oh My Tmux integration example. These values use recognizable
+# sections so the integration is easy to verify.
+
+tmux_conf_theme_status_left=" OMT #S "
+tmux_conf_theme_status_right=" %R | #{username}@#{hostname} "
+
+# Match the current development setup: C-a only, status at the bottom, and
+# left-aligned tabs. tmux-atelier enables the mouse when it loads.
+set-option -gu prefix2
+unbind-key C-a
+unbind-key C-b
+set-option -g prefix C-a
+bind-key C-a send-prefix
+set-option -g status-position bottom
+set-option -g status-justify left
+
+set-option -g @atelier_restore never
+set-option -g @atelier_status_sides on
+set-option -g @atelier_separator '│'
+set-option -g @atelier_tab_separator '│'
+
+# tmux-atelier must remain the final active tmux command in this file.
+run-shell /path/to/tmux-atelier/tmux-atelier.tmux

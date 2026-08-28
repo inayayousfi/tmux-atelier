@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_ROOT="$ROOT/.tmp/oh-my-tmux"
+OMT_ROOT="$TEST_ROOT/oh-my-tmux"
+LOCAL_CONFIG="$TEST_ROOT/tmux.conf.local"
+STATE_DIR="$TEST_ROOT/state"
+SOCKET=tmux-atelier-oh-my-tmux
+TMUX_ARGS=(new-session -s omt-atelier)
+
+if [[ ${1:-} == --detached ]]; then
+    TMUX_ARGS+=(-d)
+elif (($#)); then
+    printf 'usage: %s [--detached]\n' "$0" >&2
+    exit 2
+fi
+
+mkdir -p "$TEST_ROOT"
+if [[ ! -d $OMT_ROOT/.git ]]; then
+    git clone --depth 1 https://github.com/gpakosz/.tmux.git "$OMT_ROOT"
+fi
+
+config=$(< "$ROOT/oh-my-tmux.conf.local.example")
+config=${config//\/path\/to\/tmux-atelier/$ROOT}
+printf '%s\n' "$config" > "$LOCAL_CONFIG"
+
+# Each run starts a disposable server without touching the user's tmux server.
+tmux -L "$SOCKET" kill-server >/dev/null 2>&1 || true
+exec env -u TMUX \
+    TMUX_CONF="$OMT_ROOT/.tmux.conf" \
+    TMUX_CONF_LOCAL="$LOCAL_CONFIG" \
+    TMUX_ATELIER_STATE_DIR="$STATE_DIR" \
+    tmux -L "$SOCKET" -f "$OMT_ROOT/.tmux.conf" "${TMUX_ARGS[@]}"

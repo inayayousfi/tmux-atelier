@@ -26,13 +26,19 @@ set_default_option @atelier_add_style bold
 set_default_option @atelier_separator '│'
 set_default_option @atelier_tab_separator '│'
 set_default_option @atelier_restore prompt
+set_default_option @atelier_status_sides off
 
 TAB_STYLE=$(tmux show-options -gqv @atelier_tab_style)
 TAB_ACTIVE_STYLE=$(tmux show-options -gqv @atelier_tab_active_style)
 ADD_STYLE=$(tmux show-options -gqv @atelier_add_style)
 TAB_SEPARATOR=$(tmux show-options -gqv @atelier_tab_separator)
 TAB_SEPARATOR=${TAB_SEPARATOR//#/##}
-TABS_FORMAT="#[align=left]#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default]$TAB_SEPARATOR,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default]$TAB_SEPARATOR}#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
+TABS_FORMAT="#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default]$TAB_SEPARATOR,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default]$TAB_SEPARATOR}#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
+if [[ $(tmux show-options -gqv @atelier_status_sides) == on ]]; then
+    STATUS_FORMAT="#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]$TABS_FORMAT#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]"
+else
+    STATUS_FORMAT="#[align=left]$TABS_FORMAT"
+fi
 CLICK_COMMAND="run-shell -b \"exec $QCLI status-click \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\" \\\"#{session_name}\\\"\""
 MENU_COMMAND="run-shell -b \"exec $QCLI status-menu \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\"\""
 REFRESH_COMMAND="run-shell -b \"$QCLI refresh-status\""
@@ -44,11 +50,11 @@ TAB_MENU="display-popup -t = -e 'TMUX_ATELIER_CLIENT=#{client_name}' -E -w '45%'
 
 tmux set-option -gq @atelier_root "$ROOT"
 tmux set-option -gq @atelier_cli "$CLI"
-tmux set-option -gq @atelier_tabs_format "$TABS_FORMAT"
+tmux set-option -gq @atelier_tabs_format "$STATUS_FORMAT"
 tmux set-option -g mouse on
 tmux set-option -g status 2
 tmux set-option -g status-interval 5
-tmux set-option -g 'status-format[0]' "$TABS_FORMAT"
+tmux set-option -g 'status-format[0]' "$STATUS_FORMAT"
 tmux set-option -g 'status-format[1]' "#[range=user|new,$ADD_STYLE] + #[default,norange]"
 
 tmux unbind-key -n MouseDown1Status
@@ -64,7 +70,7 @@ while IFS= read -r binding; do
     [[ $binding =~ ^bind-key[[:space:]]+(-r[[:space:]]+)?-T[[:space:]]+prefix[[:space:]]+([^[:space:]]+)[[:space:]]+(.*)$ ]] || continue
     key=${BASH_REMATCH[2]#\\}
     action=${BASH_REMATCH[3]}
-    if [[ $action == new-window* || $action == *"$CLI"*' window '* ]]; then
+    if [[ $action == new-window || $action == *"$CLI"*' window '* ]]; then
         tmux bind-key "$key" run-shell -b "exec $QCLI window \"#{session_name}\""
     elif [[ $action == 'split-window -h'* || $action == *"$CLI"*' split vertical '* ]]; then
         tmux bind-key "$key" run-shell -b "exec $QCLI split vertical \"#{pane_id}\""
