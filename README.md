@@ -121,6 +121,29 @@ Ctrl-a l    select the pane on the right
 
 Tab and split commands read their target from tmux session options. A session created without tmux-atelier keeps native tmux behavior.
 
+## Session Restoration
+
+tmux-atelier continuously snapshots the topology of open managed workspaces. When a new tmux server starts, it can recreate their tabs, tab names, pane counts, exact split layouts, active tabs, and active panes. Local panes also return to their previous working directories when those directories still exist. SSH panes restart at the saved workspace root because tmux cannot reliably observe a remote shell's current directory.
+
+Choose the startup policy before loading the plugin:
+
+```tmux
+set-option -g @atelier_restore prompt
+run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+```
+
+The accepted values are:
+
+- `prompt` asks whether to restore everything or start fresh. This is the default.
+- `always` restores all saved workspace topologies automatically.
+- `never` starts fresh and replaces the previous snapshot.
+
+Choosing to start fresh removes only the topology snapshot. Saved workspace definitions remain available in the status line. Closing a workspace through tmux-atelier also removes it from the next snapshot.
+
+The snapshot is stored with private permissions at `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-atelier/restore.snapshot`. It is parsed strictly as data and is never sourced as shell code.
+
+Restoration starts new shells. It does not restore running processes, shell history, command output, unsaved editor state, or commands that were running before the tmux server stopped. Use a process-specific persistence mechanism or a plugin such as `tmux-resurrect` when that deeper restoration is required.
+
 ## Native Recovery
 
 Running processes belong to tmux and OpenSSH, not tmux-atelier. Removing the repository or breaking a script does not stop existing panes.

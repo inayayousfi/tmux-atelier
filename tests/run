@@ -250,6 +250,7 @@ assert_equal C-Space "$("$TMUX" show-options -gv prefix)" 'portable UI preserves
 assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
 assert_equal top "$("$TMUX" show-options -gv status-position)" 'portable UI preserves the status position'
 assert_equal on "$("$TMUX" show-options -gv mouse)" 'portable UI enables mouse interactions'
+assert_equal prompt "$("$TMUX" show-options -gqv @atelier_restore)" 'portable UI defaults to prompted restoration'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +x ')" 'user-binding' 'portable UI preserves user key bindings'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'underscore' 'portable UI reads configurable workspace styles'
 
@@ -268,6 +269,7 @@ WINDOW_LINE=$("$TMUX" display-message -p -t '=remote:' "$("$TMUX" show-options -
 FIRST_WINDOW=$("$TMUX" display-message -p -t '=remote:0' '#{window_index} #{window_name}')
 assert_contains "$WINDOW_LINE" "$FIRST_WINDOW" 'window line renders the first tab'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +w ')" 'choose-tree' 'example keeps the native tmux chooser on prefix+w'
+assert_contains "$("$TMUX" show-hooks -g client-attached)" 'restore-start' 'client attachment checks for a saved topology'
 VERTICAL_BINDING=$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +=')
 assert_contains "$VERTICAL_BINDING" 'split' 'HERDR vertical split invokes tmux-atelier'
 assert_contains "$VERTICAL_BINDING" 'vertical' 'HERDR equals key requests a vertical split'
@@ -502,5 +504,128 @@ wait "$WIZARD_CLIENT_PID" 2>/dev/null || true
 assert_equal "$((WINDOWS_AFTER + 1))" "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
 "$TMUX" display-message -p -t '=remote:' '#{session_name}' >/dev/null || fail 'existing session remains inspectable without invoking scripts'
 pass 'existing session remains inspectable without invoking scripts'
+
+"$TMUX" kill-server
+RESTORE_STATE="$TEST_ROOT/restore-state"
+RESTORE_ROOT="$TEST_ROOT/restore-root"
+RESTORE_SUB_ONE="$RESTORE_ROOT/source"
+RESTORE_SUB_TWO="$RESTORE_ROOT/tests"
+RESTORE_BAD_ROOT="$TEST_ROOT/restore-bad-root"
+mkdir -p "$RESTORE_SUB_ONE" "$RESTORE_SUB_TWO" "$RESTORE_BAD_ROOT"
+export TMUX_ATELIER_STATE_DIR="$RESTORE_STATE"
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-source-$$"
+
+"$CLI" new "local:$RESTORE_ROOT" restore-me --detached
+RESTORE_FIRST_WINDOW=$("$TMUX" display-message -p -t '=restore-me:' '#{window_id}')
+RESTORE_FIRST_PANE=$("$TMUX" display-message -p -t "$RESTORE_FIRST_WINDOW" '#{pane_id}')
+"$TMUX" rename-window -t "$RESTORE_FIRST_WINDOW" main
+"$TMUX" split-window -d -h -t "$RESTORE_FIRST_PANE" -c "$RESTORE_SUB_ONE"
+"$TMUX" split-window -d -v -t "$RESTORE_FIRST_PANE" -c "$RESTORE_SUB_TWO"
+"$CLI" window restore-me
+RESTORE_SECOND_WINDOW=$("$TMUX" display-message -p -t '=restore-me:' '#{window_id}')
+"$TMUX" rename-window -t "$RESTORE_SECOND_WINDOW" checks
+"$TMUX" split-window -d -h -t "$RESTORE_SECOND_WINDOW" -c "$RESTORE_SUB_ONE"
+"$TMUX" select-window -t "$RESTORE_FIRST_WINDOW"
+mapfile -t RESTORE_SOURCE_PANES < <("$TMUX" list-panes -t "$RESTORE_FIRST_WINDOW" -F '#{pane_id}')
+"$TMUX" select-pane -t "${RESTORE_SOURCE_PANES[1]}"
+"$CLI" new 'remote@app:/srv/restore' restore-remote --detached
+RESTORE_REMOTE_PANE=$("$TMUX" display-message -p -t '=restore-remote:' '#{pane_id}')
+"$CLI" split vertical "$RESTORE_REMOTE_PANE"
+"$CLI" new "local:$RESTORE_BAD_ROOT" restore-bad --detached
+"$CLI" snapshot
+RESTORE_SNAPSHOT_PIDS=()
+for _ in {1..8}; do
+    "$CLI" snapshot &
+    RESTORE_SNAPSHOT_PIDS+=("$!")
+done
+for RESTORE_SNAPSHOT_PID in "${RESTORE_SNAPSHOT_PIDS[@]}"; do
+    wait "$RESTORE_SNAPSHOT_PID"
+done
+assert_file "$RESTORE_STATE/restore.snapshot" 'open workspace topology is persisted'
+[[ ! -d $RESTORE_STATE/.snapshot.lock ]] || fail 'concurrent snapshots release their serialization lock'
+pass 'concurrent snapshots are serialized and release their lock'
+assert_equal 600 "$(stat -c '%a' "$RESTORE_STATE/restore.snapshot")" 'restore snapshot permissions are private'
+SOURCE_WINDOWS=$("$TMUX" list-windows -t '=restore-me:' -F '#{window_name}')
+SOURCE_MAIN_GEOMETRY=$("$TMUX" list-panes -t "$RESTORE_FIRST_WINDOW" -F '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')
+SOURCE_MAIN_PATHS=$("$TMUX" list-panes -t "$RESTORE_FIRST_WINDOW" -F '#{pane_current_path}')
+SOURCE_ACTIVE_GEOMETRY=$("$TMUX" display-message -p -t "${RESTORE_SOURCE_PANES[1]}" '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')
+cp "$RESTORE_STATE/restore.snapshot" "$TEST_ROOT/valid-restore.snapshot"
+"$TMUX" kill-server
+
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-always-$$"
+"$TMUX" new-session -d -s bootstrap 'sleep 120'
+"$TMUX" set-option -g @atelier_restore always
+"$CLI" restore-arm
+assert_equal 1 "$("$TMUX" show-options -gqv @atelier_restore_pending)" 'saved topology arms restoration on a fresh server'
+"$CLI" restore-start
+"$TMUX" has-session -t '=restore-me' || fail 'always policy restores the saved workspace'
+pass 'always policy restores the saved workspace'
+"$TMUX" has-session -t '=restore-remote' || fail 'always policy restores remote workspaces'
+pass 'always policy restores remote workspaces'
+"$TMUX" has-session -t '=restore-bad' || fail 'always policy restores every valid local workspace'
+pass 'always policy restores every valid local workspace'
+assert_equal 2 "$("$TMUX" display-message -p -t '=restore-remote:' '#{window_panes}')" 'remote restoration recreates each pane at the workspace root'
+assert_equal "$SOURCE_WINDOWS" "$("$TMUX" list-windows -t '=restore-me:' -F '#{window_name}')" 'restoration preserves tab names and order'
+RESTORED_FIRST_WINDOW=$("$TMUX" display-message -p -t '=restore-me:0' '#{window_id}')
+assert_equal 3 "$("$TMUX" display-message -p -t "$RESTORED_FIRST_WINDOW" '#{window_panes}')" 'restoration preserves split counts'
+assert_equal "$SOURCE_MAIN_GEOMETRY" "$("$TMUX" list-panes -t "$RESTORED_FIRST_WINDOW" -F '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')" 'restoration preserves the exact split layout'
+assert_equal "$SOURCE_MAIN_PATHS" "$("$TMUX" list-panes -t "$RESTORED_FIRST_WINDOW" -F '#{pane_current_path}')" 'restoration preserves local pane directories'
+assert_equal main "$("$TMUX" display-message -p -t '=restore-me:' '#{window_name}')" 'restoration preserves the active tab'
+assert_equal "$SOURCE_ACTIVE_GEOMETRY" "$("$TMUX" display-message -p -t '=restore-me:' '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')" 'restoration preserves the active pane'
+"$TMUX" kill-server
+
+cp "$TEST_ROOT/valid-restore.snapshot" "$RESTORE_STATE/restore.snapshot"
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-prompt-$$"
+"$TMUX" new-session -d -s bootstrap 'sleep 120'
+"$TMUX" set-option -g @atelier_restore prompt
+"$CLI" restore-arm
+printf 'n' | "$CLI" popup-restore
+assert_fails 'declining restoration leaves workspaces closed' "$TMUX" has-session -t '=restore-me'
+assert_no_file "$RESTORE_STATE/restore.snapshot" 'declining restoration replaces the old snapshot'
+"$TMUX" kill-server
+
+cp "$TEST_ROOT/valid-restore.snapshot" "$RESTORE_STATE/restore.snapshot"
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-never-$$"
+"$TMUX" new-session -d -s bootstrap 'sleep 120'
+"$TMUX" set-option -g @atelier_restore never
+"$CLI" restore-arm
+"$CLI" restore-start
+assert_fails 'never policy leaves saved workspaces closed' "$TMUX" has-session -t '=restore-me'
+assert_no_file "$RESTORE_STATE/restore.snapshot" 'never policy replaces the old snapshot'
+"$TMUX" kill-server
+
+printf 'invalid\0snapshot\0' > "$RESTORE_STATE/restore.snapshot"
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-invalid-$$"
+"$TMUX" new-session -d -s bootstrap 'sleep 120'
+"$TMUX" set-option -g @atelier_restore always
+"$CLI" restore-arm
+assert_fails 'invalid snapshots fail before creating sessions' "$CLI" restore-start
+assert_fails 'invalid snapshots do not create managed sessions' "$TMUX" has-session -t '=restore-me'
+"$TMUX" kill-server
+
+cp "$TEST_ROOT/valid-restore.snapshot" "$RESTORE_STATE/restore.snapshot"
+rm -f "$RESTORE_STATE/workspaces/restore-me"
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-missing-$$"
+"$TMUX" new-session -d -s bootstrap 'sleep 120'
+"$TMUX" set-option -g @atelier_restore always
+"$CLI" restore-arm
+"$CLI" restore-start
+assert_fails 'restoration skips workspaces whose definitions were removed' "$TMUX" has-session -t '=restore-me'
+"$TMUX" kill-server
+
+cp "$TEST_ROOT/valid-restore.snapshot" "$RESTORE_STATE/restore.snapshot"
+rm -rf "$RESTORE_BAD_ROOT"
+export TMUX_ATELIER_TEST_SOCKET="atelier-restore-failure-$$"
+"$TMUX" new-session -d -s bootstrap 'sleep 120'
+"$TMUX" set-option -g @atelier_restore always
+"$CLI" restore-arm
+assert_fails 'runtime restore failures are reported' "$CLI" restore-start
+assert_fails 'runtime failures roll back earlier restored sessions' "$TMUX" has-session -t '=restore-remote'
+assert_equal 1 "$("$TMUX" show-options -gqv @atelier_restore_pending)" 'runtime failures keep the snapshot pending'
+assert_equal 0 "$("$TMUX" show-options -gqv @atelier_restore_handled)" 'runtime failures allow a later retry'
+"$TMUX" set-option -g @atelier_restore prompt
+assert_fails 'a missing prompt client is reported' "$CLI" restore-start missing-client
+assert_equal 1 "$("$TMUX" show-options -gqv @atelier_restore_pending)" 'prompt launch failures keep the snapshot pending'
+assert_equal 0 "$("$TMUX" show-options -gqv @atelier_restore_handled)" 'prompt launch failures allow another attachment to retry'
 
 printf '1..%d\n' "$TESTS"

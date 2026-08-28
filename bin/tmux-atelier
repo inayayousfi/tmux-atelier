@@ -6,11 +6,15 @@ readonly TMUX_BIN="${TMUX_ATELIER_TMUX:-tmux}"
 readonly STATE_ROOT="${TMUX_ATELIER_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tmux-atelier}"
 readonly WORKSPACES_DIR="$STATE_ROOT/workspaces"
 readonly DEBUG_LOG="${TMUX_ATELIER_DEBUG_LOG:-$STATE_ROOT/debug.log}"
+readonly RESTORE_FILE="$STATE_ROOT/restore.snapshot"
+readonly SNAPSHOT_LOCK="$STATE_ROOT/.snapshot.lock"
 
 WORKSPACE_NAME=
 WORKSPACE_DESTINATION=
 WORKSPACE_PATH=
 WORKSPACE_CREATED=
+SNAPSHOT_TOKEN=
+RESTORE_ACTIVE=
 declare -A SSH_CONFIG_SEEN=()
 declare -a SSH_COMMON_ARGS=()
 
@@ -215,10 +219,11 @@ mark_session() {
 }
 
 create_session() {
-    local name=$1 destination=$2 path=$3 command
+    local name=$1 destination=$2 path=$3 initial_path=${4:-$3} command
     if [[ $destination == local ]]; then
         [[ -d $path ]] || die "local path is not a directory: $path"
-        tmux_cmd new-session -d -s "$name" -c "$path" || return 1
+        [[ -d $initial_path ]] || initial_path=$path
+        tmux_cmd new-session -d -s "$name" -c "$initial_path" || return 1
     else
         command=$(remote_shell_command "$destination" "$path")
         tmux_cmd new-session -d -s "$name" "$command" || return 1
@@ -227,6 +232,383 @@ create_session() {
         tmux_cmd kill-session -t "=$name" 2>/dev/null || true
         return 1
     fi
+}
+
+snapshot_field() {
+    printf '%s\0' "$1" >&3
+}
+
+write_snapshot() {
+    local exclude_session=${1:-} exclude_window=${2:-}
+    local pending temporary session activity active_activity=-1
+    local window pane path active_window active_pane pane_ordinal
+    local candidate
+    local -a sessions=() windows panes filtered_windows
+
+    pending=$(tmux_cmd show-options -gqv @atelier_restore_pending 2>/dev/null || true)
+    [[ $pending != 1 ]] || return 0
+
+    while IFS= read -r session; do
+        [[ -n $session ]] || continue
+        [[ $(session_option "$session" @atelier_managed) == 1 ]] || continue
+        [[ -f $(workspace_file "$session") ]] || continue
+        [[ $session != "$exclude_session" ]] || continue
+        sessions+=("$session")
+        activity=$(tmux_cmd display-message -p -t "=$session:" '#{session_activity}')
+        if ((activity > active_activity)); then
+            RESTORE_ACTIVE=$session
+            active_activity=$activity
+        fi
+    done < <(session_names)
+
+    if ((${#sessions[@]} == 0)); then
+        rm -f "$RESTORE_FILE"
+        return 0
+    fi
+
+    mkdir -p "$STATE_ROOT"
+    chmod 700 "$STATE_ROOT"
+    temporary=$(mktemp "$STATE_ROOT/.restore.XXXXXX") || return 1
+    chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
+
+    if ! (
+        exec 3> "$temporary"
+        snapshot_field tmux-atelier-restore
+        snapshot_field 1
+        snapshot_field active
+        snapshot_field "$RESTORE_ACTIVE"
+        for session in "${sessions[@]}"; do
+            active_window=$(tmux_cmd display-message -p -t "=$session:" '#{window_index}')
+            mapfile -t windows < <(tmux_cmd list-windows -t "=$session:" -F '#{window_id}')
+            filtered_windows=()
+            for candidate in "${windows[@]}"; do
+                [[ $candidate == "$exclude_window" ]] || filtered_windows+=("$candidate")
+            done
+            ((${#filtered_windows[@]} > 0)) || continue
+            if [[ -n $exclude_window &&
+                $exclude_window == "$(tmux_cmd display-message -p -t "=$session:$active_window" '#{window_id}')" ]]; then
+                active_window=$(tmux_cmd display-message -p -t "${filtered_windows[0]}" '#{window_index}')
+            fi
+            snapshot_field workspace
+            snapshot_field "$session"
+            snapshot_field "$active_window"
+            for window in "${filtered_windows[@]}"; do
+                snapshot_field window
+                snapshot_field "$(tmux_cmd display-message -p -t "$window" '#{window_index}')"
+                snapshot_field "$(tmux_cmd display-message -p -t "$window" '#{window_name}')"
+                snapshot_field "$(tmux_cmd display-message -p -t "$window" '#{window_layout}')"
+                mapfile -t panes < <(tmux_cmd list-panes -t "$window" -F '#{pane_id}')
+                snapshot_field "${#panes[@]}"
+                active_pane=0
+                pane_ordinal=0
+                for pane in "${panes[@]}"; do
+                    [[ $(tmux_cmd display-message -p -t "$pane" '#{pane_active}') == 1 ]] &&
+                        active_pane=$pane_ordinal
+                    ((++pane_ordinal))
+                done
+                snapshot_field "$active_pane"
+                for pane in "${panes[@]}"; do
+                    path=
+                    if [[ $(session_option "$session" @atelier_destination) == local ]]; then
+                        path=$(tmux_cmd display-message -p -t "$pane" '#{pane_current_path}')
+                    fi
+                    snapshot_field pane
+                    snapshot_field "$path"
+                done
+                snapshot_field end-window
+            done
+            snapshot_field end-workspace
+        done
+        snapshot_field end
+        exec 3>&-
+    ); then
+        rm -f "$temporary"
+        return 1
+    fi
+    mv -f "$temporary" "$RESTORE_FILE"
+}
+
+command_snapshot() {
+    local attempt acquired=0
+    mkdir -p "$STATE_ROOT"
+    chmod 700 "$STATE_ROOT"
+    for ((attempt = 0; attempt < 500; ++attempt)); do
+        if mkdir "$SNAPSHOT_LOCK" 2>/dev/null; then
+            acquired=1
+            break
+        fi
+        sleep 0.01
+    done
+    ((acquired)) || die 'could not acquire snapshot lock'
+    (
+        trap 'rmdir "$SNAPSHOT_LOCK"' EXIT
+        write_snapshot "$@"
+    )
+}
+
+snapshot_read() {
+    IFS= read -r -d '' SNAPSHOT_TOKEN <&3
+}
+
+snapshot_expect() {
+    snapshot_read && [[ $SNAPSHOT_TOKEN == "$1" ]]
+}
+
+validate_snapshot() (
+    local active name active_window window_index window_name layout pane_count active_pane path i
+    local workspace_total=0 window_total=0 pane_total=0
+    declare -A workspaces=() windows=()
+    [[ -f $RESTORE_FILE ]] || return 1
+    exec 3< "$RESTORE_FILE"
+    snapshot_expect tmux-atelier-restore || return 1
+    snapshot_expect 1 || return 1
+    snapshot_expect active || return 1
+    snapshot_read || return 1
+    [[ -z $SNAPSHOT_TOKEN || $SNAPSHOT_TOKEN =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ ]] || return 1
+    active=$SNAPSHOT_TOKEN
+
+    while snapshot_read; do
+        if [[ $SNAPSHOT_TOKEN == end ]]; then
+            snapshot_read && return 1
+            [[ -n ${workspaces[$active]:-} ]] || return 1
+            printf '%s\t%s\t%s\t%s\n' "$active" "$workspace_total" "$window_total" "$pane_total"
+            return 0
+        fi
+        [[ $SNAPSHOT_TOKEN == workspace ]] || return 1
+        ((++workspace_total))
+        snapshot_read || return 1; name=$SNAPSHOT_TOKEN
+        [[ $name =~ ^[A-Za-z0-9_][A-Za-z0-9_-]*$ && -z ${workspaces[$name]:-} ]] || return 1
+        workspaces[$name]=1
+        snapshot_read || return 1; active_window=$SNAPSHOT_TOKEN
+        [[ $active_window =~ ^[0-9]+$ ]] || return 1
+        windows=()
+
+        while snapshot_read; do
+            [[ $SNAPSHOT_TOKEN != end-workspace ]] || break
+            [[ $SNAPSHOT_TOKEN == window ]] || return 1
+            ((++window_total))
+            snapshot_read || return 1; window_index=$SNAPSHOT_TOKEN
+            [[ $window_index =~ ^[0-9]+$ && -z ${windows[$window_index]:-} ]] || return 1
+            windows[$window_index]=1
+            snapshot_read || return 1; window_name=$SNAPSHOT_TOKEN
+            [[ $window_name != *$'\n'* ]] || return 1
+            snapshot_read || return 1; layout=$SNAPSHOT_TOKEN
+            [[ -n $layout && $layout != *$'\n'* ]] || return 1
+            snapshot_read || return 1; pane_count=$SNAPSHOT_TOKEN
+            [[ $pane_count =~ ^[1-9][0-9]*$ ]] || return 1
+            ((pane_total += 10#$pane_count))
+            snapshot_read || return 1; active_pane=$SNAPSHOT_TOKEN
+            [[ $active_pane =~ ^[0-9]+$ ]] || return 1
+            ((10#$active_pane < 10#$pane_count)) || return 1
+            for ((i = 0; i < 10#$pane_count; ++i)); do
+                snapshot_expect pane || return 1
+                snapshot_read || return 1; path=$SNAPSHOT_TOKEN
+            done
+            snapshot_expect end-window || return 1
+        done
+        ((${#windows[@]} > 0)) || return 1
+        [[ -n ${windows[$active_window]:-} ]] || return 1
+    done
+    return 1
+)
+
+create_restore_window() {
+    local session=$1 destination=$2 root=$3 initial_path=$4 command
+    if [[ $destination == local ]]; then
+        [[ -d $initial_path ]] || initial_path=$root
+        tmux_cmd new-window -a -d -P -F '#{window_id}' -t "=$session:{end}" -c "$initial_path"
+    else
+        command=$(remote_shell_command "$destination" "$root")
+        tmux_cmd new-window -a -d -P -F '#{window_id}' -t "=$session:{end}" "$command"
+    fi
+}
+
+create_restore_pane() {
+    local window=$1 destination=$2 root=$3 path=$4 command
+    if [[ $destination == local ]]; then
+        [[ -d $path ]] || path=$root
+        tmux_cmd split-window -d -t "$window" -c "$path"
+    else
+        command=$(remote_shell_command "$destination" "$root")
+        tmux_cmd split-window -d -t "$window" "$command"
+    fi
+}
+
+restore_snapshot_data() {
+    local created_file=$1 active name active_window window_index window_name layout pane_count active_pane
+    local destination root window restored_active_window path i skip first_window
+    local -a paths panes
+    exec 3< "$RESTORE_FILE"
+    snapshot_expect tmux-atelier-restore
+    snapshot_expect 1
+    snapshot_expect active
+    snapshot_read; active=$SNAPSHOT_TOKEN
+    RESTORE_ACTIVE=$active
+
+    while snapshot_read && [[ $SNAPSHOT_TOKEN != end ]]; do
+        snapshot_read; name=$SNAPSHOT_TOKEN
+        snapshot_read; active_window=$SNAPSHOT_TOKEN
+        skip=0
+        first_window=1
+        restored_active_window=
+        if session_exists "$name" || [[ ! -f $(workspace_file "$name") ]]; then
+            skip=1
+        else
+            read_workspace "$name"
+            destination=$WORKSPACE_DESTINATION
+            root=$WORKSPACE_PATH
+        fi
+
+        while snapshot_read && [[ $SNAPSHOT_TOKEN != end-workspace ]]; do
+            snapshot_read; window_index=$SNAPSHOT_TOKEN
+            snapshot_read; window_name=$SNAPSHOT_TOKEN
+            snapshot_read; layout=$SNAPSHOT_TOKEN
+            snapshot_read; pane_count=$SNAPSHOT_TOKEN
+            snapshot_read; active_pane=$SNAPSHOT_TOKEN
+            paths=()
+            for ((i = 0; i < 10#$pane_count; ++i)); do
+                snapshot_expect pane
+                snapshot_read; paths+=("$SNAPSHOT_TOKEN")
+            done
+            snapshot_expect end-window
+            ((skip)) && continue
+
+            if ((first_window)); then
+                printf '%s\n' "$name" >> "$created_file"
+                create_session "$name" "$destination" "$root" "${paths[0]}"
+                window=$(tmux_cmd display-message -p -t "=$name:" '#{window_id}')
+                first_window=0
+            else
+                window=$(create_restore_window "$name" "$destination" "$root" "${paths[0]}")
+            fi
+            for ((i = 1; i < 10#$pane_count; ++i)); do
+                create_restore_pane "$window" "$destination" "$root" "${paths[$i]}"
+            done
+            tmux_cmd select-layout -t "$window" "$layout" >/dev/null
+            tmux_cmd rename-window -t "$window" "$window_name"
+            mapfile -t panes < <(tmux_cmd list-panes -t "$window" -F '#{pane_id}')
+            if [[ $destination == local ]]; then
+                for ((i = 0; i < 10#$pane_count; ++i)); do
+                    path=${paths[$i]}
+                    [[ -d $path ]] || path=$root
+                    tmux_cmd respawn-pane -k -t "${panes[$i]}" -c "$path"
+                done
+            fi
+            tmux_cmd select-pane -t "${panes[10#$active_pane]}"
+            [[ $window_index != "$active_window" ]] || restored_active_window=$window
+        done
+        ((skip)) || tmux_cmd select-window -t "$restored_active_window"
+    done
+}
+
+command_restore_discard() {
+    rm -f "$RESTORE_FILE"
+    tmux_cmd set-option -gq @atelier_restore_pending 0
+    tmux_cmd set-option -gq @atelier_restore_handled 1
+    command_snapshot
+}
+
+rollback_restore() {
+    local created_file=$1 name
+    while IFS= read -r name; do
+        [[ -n $name ]] || continue
+        tmux_cmd kill-session -t "=$name" 2>/dev/null || true
+    done < "$created_file"
+}
+
+command_restore() {
+    local client=${1:-} metadata active created_file status
+    [[ -f $RESTORE_FILE ]] || return 0
+    if ! metadata=$(validate_snapshot); then
+        command_restore_discard
+        die 'invalid restore snapshot'
+    fi
+    IFS=$'\t' read -r active _ <<< "$metadata"
+    created_file=$(mktemp "$STATE_ROOT/.restore-created.XXXXXX") || return 1
+    tmux_cmd set-option -gq @atelier_restore_pending 1
+    tmux_cmd set-option -gq @atelier_restore_handled 0
+    set +e
+    (
+        set -e
+        trap 'rollback_restore "$created_file"' EXIT
+        restore_snapshot_data "$created_file"
+        trap - EXIT
+    )
+    status=$?
+    set -e
+    rm -f "$created_file"
+    if ((status != 0)); then
+        tmux_cmd set-option -gq @atelier_restore_pending 1
+        tmux_cmd set-option -gq @atelier_restore_handled 0
+        die 'workspace restoration failed'
+    fi
+    tmux_cmd set-option -gq @atelier_restore_pending 0
+    tmux_cmd set-option -gq @atelier_restore_handled 1
+    command_snapshot
+    command_refresh_status
+    if [[ -n $client && -n $active ]] && session_exists "$active"; then
+        tmux_cmd switch-client -c "$client" -t "=$active"
+    fi
+}
+
+command_popup_restore() {
+    local client=${1:-} metadata workspaces windows panes choice
+    metadata=$(validate_snapshot) || die 'invalid restore snapshot'
+    IFS=$'\t' read -r _ workspaces windows panes <<< "$metadata"
+    trap 'command_restore_discard >/dev/null 2>&1 || true' EXIT
+    printf 'Restore %s workspaces, %s tabs, and %s panes? [y/N] ' \
+        "$workspaces" "$windows" "$panes"
+    if read -r -n 1 choice && [[ $choice == y || $choice == Y ]]; then
+        printf '\n'
+        trap - EXIT
+        command_restore "$client"
+    else
+        printf '\nStarting fresh.\n'
+        trap - EXIT
+        command_restore_discard
+    fi
+}
+
+command_restore_arm() {
+    local handled session
+    handled=$(tmux_cmd show-options -gqv @atelier_restore_handled 2>/dev/null || true)
+    [[ -z $handled ]] || return 0
+    while IFS= read -r session; do
+        if [[ -n $session && $(session_option "$session" @atelier_managed) == 1 ]]; then
+            tmux_cmd set-option -gq @atelier_restore_handled 1
+            tmux_cmd set-option -gq @atelier_restore_pending 0
+            command_snapshot
+            return 0
+        fi
+    done < <(session_names)
+    if [[ -f $RESTORE_FILE ]]; then
+        tmux_cmd set-option -gq @atelier_restore_handled 0
+        tmux_cmd set-option -gq @atelier_restore_pending 1
+    else
+        tmux_cmd set-option -gq @atelier_restore_handled 1
+        tmux_cmd set-option -gq @atelier_restore_pending 0
+    fi
+}
+
+command_restore_start() {
+    local client=${1:-} mode handled cli qcli command
+    handled=$(tmux_cmd show-options -gqv @atelier_restore_handled 2>/dev/null || true)
+    [[ $handled == 0 ]] || return 0
+    [[ -f $RESTORE_FILE ]] || { command_restore_discard; return; }
+    mode=$(tmux_cmd show-options -gqv @atelier_restore 2>/dev/null || true)
+    mode=${mode:-prompt}
+    [[ $mode == always || $mode == never || $mode == prompt ]] ||
+        die 'invalid @atelier_restore value: expected always, never, or prompt'
+    case $mode in
+        always) command_restore "$client" ;;
+        never) command_restore_discard ;;
+        prompt)
+            [[ -n $client ]] || return 0
+            cli=$(cli_path); qcli=$(quote_sh "$cli")
+            command="$qcli popup-restore $(quote_sh "$client")"
+            tmux_cmd display-popup -c "$client" -E -w '55%' -h '20%' "$command"
+            ;;
+    esac
 }
 
 refresh_status_if_running() {
@@ -263,6 +645,7 @@ command_new() {
     if ! create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH"; then
         die "definition saved, but the session could not be created: $name"
     fi
+    command_snapshot
     refresh_status_if_running
     select_session "$name" "$([[ $detached == --detached ]] && printf 1 || printf 0)"
 }
@@ -284,6 +667,7 @@ command_open() {
         read_workspace "$name"
         create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH"
     fi
+    command_snapshot
     refresh_status_if_running
     select_session "$name" "$([[ $detached == --detached ]] && printf 1 || printf 0)"
 }
@@ -307,6 +691,7 @@ command_window() {
         command=$(remote_shell_command "$destination" "$path")
         tmux_cmd new-window -a -t "=$session:{end}" "$command"
     fi
+    command_snapshot
 }
 
 command_split() {
@@ -330,6 +715,7 @@ command_split() {
         command=$(remote_shell_command "$destination" "$path")
         tmux_cmd "${split_args[@]}" "$command"
     fi
+    command_snapshot
 }
 
 definition_names() {
@@ -601,23 +987,47 @@ command_popup_tab_rename() {
     debug_log "tab-rename-input submitted window=$window length=${#new}"
     validate_value 'tab name' "$new"
     tmux_cmd rename-window -t "$window" "$new"
+    command_snapshot
     debug_log "tab-rename-input completed window=$window"
 }
 
 command_request_tab_close() {
-    local window=${1:-} client=${2:-} name
+    local window=${1:-} client=${2:-} name cli qcli command
     [[ $window =~ ^@[0-9]+$ ]] || die "invalid tmux window id: $window"
     name=$(tmux_cmd display-message -p -t "$window" '#{window_name}')
+    cli=$(cli_path); qcli=$(quote_sh "$cli")
+    command="run-shell -b \"$qcli tab-close $(quote_sh "$window")\""
     local -a confirm_args=(confirm-before)
     [[ -z $client ]] || confirm_args+=(-t "$client")
-    tmux_cmd "${confirm_args[@]}" -p "Close tab $name? (y/n)" "kill-window -t $window"
+    tmux_cmd "${confirm_args[@]}" -p "Close tab $name? (y/n)" "$command"
+}
+
+command_tab_close() {
+    local window=${1:-} session window_count
+    [[ $window =~ ^@[0-9]+$ ]] || die "invalid tmux window id: $window"
+    session=$(tmux_cmd display-message -p -t "$window" '#{session_name}')
+    window_count=$(tmux_cmd display-message -p -t "$window" '#{session_windows}')
+    if ((window_count == 1)); then
+        command_snapshot "$session"
+    else
+        command_snapshot '' "$window"
+    fi
+    if ! tmux_cmd kill-window -t "$window"; then
+        command_snapshot
+        return 1
+    fi
+    refresh_status_if_running
 }
 
 command_close() {
     local name=${1:-}
     validate_name "$name"
     session_exists "$name" || die "session is not running: $name"
-    tmux_cmd kill-session -t "=$name"
+    command_snapshot "$name"
+    if ! tmux_cmd kill-session -t "=$name"; then
+        command_snapshot
+        return 1
+    fi
     refresh_status_if_running
 }
 
@@ -626,6 +1036,7 @@ command_delete() {
     file=$(workspace_file "$name")
     [[ -f $file ]] || die "workspace definition not found: $name"
     rm -f "$file"
+    command_snapshot
     refresh_status_if_running
 }
 
@@ -691,6 +1102,7 @@ command_rename() {
         fi
         rm -f "$old_file"
     fi
+    command_snapshot
     refresh_status_if_running
 }
 
@@ -1017,6 +1429,8 @@ Commands:
   popup-new
   popup-workspace-menu NAME
   popup-tab-menu WINDOW_ID
+  snapshot
+  restore-start [CLIENT]
   refresh-status
 EOF
 }
@@ -1037,6 +1451,7 @@ main() {
         popup-new) (($# == 0)) || die 'usage: tmux-atelier popup-new'; command_popup_new ;;
         popup-workspace-menu) (($# == 1)) || die 'usage: tmux-atelier popup-workspace-menu name'; command_popup_workspace_menu "$@" ;;
         popup-tab-menu) (($# == 1)) || die 'usage: tmux-atelier popup-tab-menu window-id'; command_popup_tab_menu "$@" ;;
+        popup-restore) (($# <= 1)) || die 'usage: tmux-atelier popup-restore [client]'; command_popup_restore "$@" ;;
         popup-tab-rename) (($# == 1)) || die 'usage: tmux-atelier popup-tab-rename window-id'; command_popup_tab_rename "$@" ;;
         popup-rename) (($# == 1)) || die 'usage: tmux-atelier popup-rename name'; command_popup_rename "$@" ;;
         popup-edit) (($# == 1)) || die 'usage: tmux-atelier popup-edit name'; command_popup_edit "$@" ;;
@@ -1048,7 +1463,13 @@ main() {
         request-rename) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-rename name [client]'; command_request_rename "$@" ;;
         request-tab-rename) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-tab-rename window-id [client]'; command_request_tab_rename "$@" ;;
         request-tab-close) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-tab-close window-id [client]'; command_request_tab_close "$@" ;;
+        tab-close) (($# == 1)) || die 'usage: tmux-atelier tab-close window-id'; command_tab_close "$@" ;;
         request-delete) ((1 <= $# && $# <= 2)) || die 'usage: tmux-atelier request-delete name [client]'; command_request_delete "$@" ;;
+        snapshot) (($# == 0)) || die 'usage: tmux-atelier snapshot'; command_snapshot ;;
+        restore-arm) (($# == 0)) || die 'usage: tmux-atelier restore-arm'; command_restore_arm ;;
+        restore-start) (($# <= 1)) || die 'usage: tmux-atelier restore-start [client]'; command_restore_start "$@" ;;
+        restore) (($# <= 1)) || die 'usage: tmux-atelier restore [client]'; command_restore "$@" ;;
+        restore-discard) (($# == 0)) || die 'usage: tmux-atelier restore-discard'; command_restore_discard ;;
         debug-path) (($# == 0)) || die 'usage: tmux-atelier debug-path'; printf '%s\n' "$DEBUG_LOG" ;;
         debug-clear) (($# == 0)) || die 'usage: tmux-atelier debug-clear'; mkdir -p "$STATE_ROOT"; : > "$DEBUG_LOG"; chmod 600 "$DEBUG_LOG" ;;
         help|-h|--help) (($# == 0)) || die 'usage: tmux-atelier help'; usage ;;

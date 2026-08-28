@@ -24,6 +24,7 @@ set_default_option @atelier_workspace_live_style bold
 set_default_option @atelier_workspace_stopped_style dim
 set_default_option @atelier_add_style bold
 set_default_option @atelier_separator '│'
+set_default_option @atelier_restore prompt
 
 TAB_STYLE=$(tmux show-options -gqv @atelier_tab_style)
 TAB_ACTIVE_STYLE=$(tmux show-options -gqv @atelier_tab_active_style)
@@ -32,6 +33,8 @@ TABS_FORMAT="#[align=left]#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #
 CLICK_COMMAND="run-shell -b \"exec $QCLI status-click \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\" \\\"#{session_name}\\\"\""
 MENU_COMMAND="run-shell -b \"exec $QCLI status-menu \\\"#{mouse_status_range}\\\" \\\"#{client_name}\\\"\""
 REFRESH_COMMAND="run-shell -b \"$QCLI refresh-status\""
+SAVE_COMMAND="run-shell -b \"$QCLI snapshot\""
+RESTORE_COMMAND="run-shell -b \"$QCLI restore-start \\\"#{client_name}\\\"\""
 TAB_MENU="display-popup -t = -e 'TMUX_ATELIER_CLIENT=#{client_name}' -E -w '45%' -h '30%' \"exec $QCLI popup-tab-menu \\\"#{window_id}\\\"\""
 
 tmux set-option -gq @atelier_root "$ROOT"
@@ -50,8 +53,17 @@ tmux bind-key -n MouseDown3Status if-shell -F '#{m:a*,#{mouse_status_range}}' \
     "$MENU_COMMAND" \
     "$TAB_MENU"
 
+"$CLI" restore-arm
+
 for hook in session-created session-closed session-renamed client-session-changed; do
     tmux set-hook -g "${hook}[90]" "$REFRESH_COMMAND"
 done
+
+for hook in after-new-window after-split-window after-kill-pane after-select-layout \
+    window-layout-changed window-renamed \
+    session-window-changed window-pane-changed client-session-changed client-detached; do
+    tmux set-hook -g "${hook}[91]" "$SAVE_COMMAND"
+done
+tmux set-hook -g 'client-attached[90]' "$RESTORE_COMMAND"
 
 "$CLI" refresh-status

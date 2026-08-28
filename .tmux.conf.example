@@ -15,6 +15,9 @@ set-option -g @atelier_workspace_stopped_style dim
 set-option -g @atelier_add_style bold
 set-option -g @atelier_separator '│'
 
+# Restore the previous workspace, tab, and split topology: prompt, always, or never.
+set-option -g @atelier_restore prompt
+
 run-shell /path/to/tmux-atelier/tmux-atelier.tmux
 
 # Prefix+w keeps tmux's native session and window chooser.
