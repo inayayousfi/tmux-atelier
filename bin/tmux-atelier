@@ -1138,10 +1138,42 @@ command_tab_close() {
     refresh_status_if_running
 }
 
+close_fallback_session() {
+    local excluded=$1 candidate
+    while IFS= read -r candidate; do
+        [[ -n $candidate && $candidate != "$excluded" ]] || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done < <(session_names)
+
+    while IFS= read -r candidate; do
+        [[ -n $candidate && $candidate != "$excluded" ]] || continue
+        if (command_open "$candidate" --detached) >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(definition_names)
+    return 1
+}
+
 command_close() {
-    local name=${1:-}
+    local name=${1:-} session client fallback=''
+    local -a clients=()
     validate_name "$name"
     session_exists "$name" || die "session is not running: $name"
+
+    while IFS=$'\t' read -r session client; do
+        [[ $session == "$name" && -n $client ]] && clients+=("$client")
+    done < <(tmux_cmd list-clients -F $'#{session_name}\t#{client_name}' 2>/dev/null || true)
+    if ((${#clients[@]} > 0)); then
+        fallback=$(close_fallback_session "$name") ||
+            die "cannot close the only workspace while a client is attached"
+    fi
+
+    for client in "${clients[@]}"; do
+        tmux_cmd switch-client -c "$client" -t "=$fallback" ||
+            die "could not switch client away from workspace: $name"
+    done
     command_snapshot "$name"
     if ! tmux_cmd kill-session -t "=$name"; then
         command_snapshot

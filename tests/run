@@ -453,6 +453,26 @@ mapfile -d '' -t DEFERRED_RENAME_ARGS < "$COMMAND_LOG"
 assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'run-shell' 'native workspace rename is not mistaken for FZF cancellation'
 assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'request-rename' 'native workspace rename schedules its input popup'
 
+"$CLI" new "local:$LOCAL_ONE" close-current --detached
+sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=close-current' > "$TEST_ROOT/close-client.log" 2>&1 &
+CLOSE_CLIENT_PID=$!
+CLOSE_CLIENT=
+for _ in {1..10}; do
+    CLOSE_CLIENT=$("$TMUX" list-clients -F '#{client_name}' 2>/dev/null | while IFS= read -r CLIENT; do
+        [[ $("$TMUX" display-message -p -c "$CLIENT" '#{session_name}') == close-current ]] && printf '%s\n' "$CLIENT"
+    done)
+    [[ -n $CLOSE_CLIENT ]] && break
+    sleep 0.1
+done
+[[ -n $CLOSE_CLIENT ]] || fail "control client starts for workspace close: $(< "$TEST_ROOT/close-client.log")"
+"$CLI" close close-current
+assert_fails 'closing the current workspace removes its session' "$TMUX" has-session -t '=close-current'
+CLOSE_FALLBACK=$("$TMUX" display-message -p -c "$CLOSE_CLIENT" '#{session_name}')
+[[ -n $CLOSE_FALLBACK && $CLOSE_FALLBACK != close-current ]] || fail 'closing the current workspace switches its client'
+pass 'closing the current workspace switches its client'
+"$TMUX" detach-client -t "$CLOSE_CLIENT"
+wait "$CLOSE_CLIENT_PID" 2>/dev/null || true
+
 : > "$COMMAND_LOG"
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \

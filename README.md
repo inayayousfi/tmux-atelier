@@ -83,7 +83,7 @@ Names may contain ASCII letters, digits, `_`, and `-`. When no name is given, tm
 
 The `created` value keeps workspaces in creation order. Older definitions without it use their file modification time. Renaming a workspace preserves this value and its position. Native tmux sessions are merged into the same line using their tmux creation time.
 
-A definition and its live session are separate. `close` stops the session but keeps its definition. `delete` removes the definition but leaves a live session alone.
+A definition and its live session are separate. `close` stops the session but keeps its definition. When a client is using that workspace, it switches to another live workspace first, or opens another saved workspace when necessary. `delete` removes the definition but leaves a live session alone.
 
 Every new native tmux session is adopted as a local workspace. tmux-atelier reads the first pane's canonical working directory, reuses a saved workspace that already points there, or creates a new definition whose name comes from the directory name. If the matching workspace is already running, the temporary session is removed and its client switches to the existing workspace.
 
