@@ -646,13 +646,13 @@ SOURCE_MAIN_GEOMETRY=$("$TMUX" list-panes -t "$RESTORE_FIRST_WINDOW" -F '#{pane_
 SOURCE_MAIN_PATHS=$("$TMUX" list-panes -t "$RESTORE_FIRST_WINDOW" -F '#{pane_current_path}')
 SOURCE_ACTIVE_GEOMETRY=$("$TMUX" display-message -p -t "${RESTORE_SOURCE_PANES[1]}" '#{pane_left},#{pane_top},#{pane_width},#{pane_height}')
 cp "$RESTORE_STATE/restore.snapshot" "$TEST_ROOT/valid-restore.snapshot"
+mapfile -d '' -t RESTORE_SNAPSHOT_FIELDS < "$TEST_ROOT/valid-restore.snapshot"
+RESTORE_EXPECTED_ACTIVE=${RESTORE_SNAPSHOT_FIELDS[3]}
 "$TMUX" kill-server
 
 export TMUX_ATELIER_TEST_SOCKET="atelier-restore-always-$$"
 "$TMUX" new-session -d -s bootstrap 'sleep 120'
 "$TMUX" set-option -g @atelier_restore always
-"$CLI" restore-arm
-assert_equal 1 "$("$TMUX" show-options -gqv @atelier_restore_pending)" 'saved topology arms restoration on a fresh server'
 sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=bootstrap' > "$TEST_ROOT/restore-client.log" 2>&1 &
 RESTORE_CLIENT_PID=$!
 RESTORE_CLIENT=
@@ -662,11 +662,18 @@ for _ in {1..10}; do
     sleep 0.1
 done
 [[ -n $RESTORE_CLIENT ]] || fail "control client starts for restoration: $(< "$TEST_ROOT/restore-client.log")"
-"$CLI" restore-start "$RESTORE_CLIENT"
+"$ROOT/tmux-atelier.tmux"
+for _ in {1..20}; do
+    if "$TMUX" has-session -t '=restore-me' 2>/dev/null &&
+        ! "$TMUX" has-session -t '=bootstrap' 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
 "$TMUX" has-session -t '=restore-me' || fail 'always policy restores the saved workspace'
-pass 'always policy restores the saved workspace'
+pass 'plugin restores saved workspaces when its first client was already attached'
 assert_fails 'successful restoration removes the current-directory bootstrap session' "$TMUX" has-session -t '=bootstrap'
-assert_equal restore-me "$("$TMUX" display-message -p -c "$RESTORE_CLIENT" '#{session_name}')" 'restoration switches the client to the previously active workspace'
+assert_equal "$RESTORE_EXPECTED_ACTIVE" "$("$TMUX" display-message -p -c "$RESTORE_CLIENT" '#{session_name}')" 'restoration switches the client to the previously active workspace'
 "$TMUX" has-session -t '=restore-remote' || fail 'always policy restores remote workspaces'
 pass 'always policy restores remote workspaces'
 "$TMUX" has-session -t '=restore-bad' || fail 'always policy restores every valid local workspace'

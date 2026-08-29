@@ -596,6 +596,7 @@ command_restore_discard() {
     rm -f "$RESTORE_FILE"
     tmux_cmd set-option -gq @atelier_restore_pending 0
     tmux_cmd set-option -gq @atelier_restore_handled 1
+    tmux_cmd set-option -gq @atelier_restore_started 1
     command_snapshot
     if [[ -n $client ]]; then
         session=$(tmux_cmd display-message -p -c "$client" '#{session_name}' 2>/dev/null || true)
@@ -640,11 +641,13 @@ command_restore() {
     if ((status != 0)); then
         tmux_cmd set-option -gq @atelier_restore_pending 1
         tmux_cmd set-option -gq @atelier_restore_handled 0
+        tmux_cmd set-option -gq @atelier_restore_started 0
         debug_log 'restore failed; created sessions rolled back and retry enabled'
         die 'workspace restoration failed'
     fi
     tmux_cmd set-option -gq @atelier_restore_pending 0
     tmux_cmd set-option -gq @atelier_restore_handled 1
+    tmux_cmd set-option -gq @atelier_restore_started 1
     command_snapshot
     command_refresh_status
     if [[ -n $client && -n $active ]] && session_exists "$active"; then
@@ -689,6 +692,7 @@ command_restore_arm() {
         if [[ -n $session && $(session_option "$session" @atelier_managed) == 1 ]]; then
             tmux_cmd set-option -gq @atelier_restore_handled 1
             tmux_cmd set-option -gq @atelier_restore_pending 0
+            tmux_cmd set-option -gq @atelier_restore_started 1
             debug_log "restore arm found live managed session=$session"
             command_snapshot
             return 0
@@ -697,16 +701,18 @@ command_restore_arm() {
     if [[ -f $RESTORE_FILE ]]; then
         tmux_cmd set-option -gq @atelier_restore_handled 0
         tmux_cmd set-option -gq @atelier_restore_pending 1
+        tmux_cmd set-option -gq @atelier_restore_started 0
         debug_log 'restore armed from saved snapshot'
     else
         tmux_cmd set-option -gq @atelier_restore_handled 1
         tmux_cmd set-option -gq @atelier_restore_pending 0
+        tmux_cmd set-option -gq @atelier_restore_started 1
         debug_log 'restore arm found no saved snapshot'
     fi
 }
 
 command_restore_start() {
-    local client=${1:-} mode handled cli qcli command
+    local client=${1:-} mode handled started cli qcli command
     handled=$(tmux_cmd show-options -gqv @atelier_restore_handled 2>/dev/null || true)
     if [[ $handled != 0 ]]; then
         debug_log "restore start skipped client=$client handled=$handled"
@@ -715,17 +721,35 @@ command_restore_start() {
     [[ -f $RESTORE_FILE ]] || { command_restore_discard "$client"; return; }
     mode=$(tmux_cmd show-options -gqv @atelier_restore 2>/dev/null || true)
     mode=${mode:-prompt}
-    debug_log "restore start client=$client mode=$mode"
     [[ $mode == always || $mode == never || $mode == prompt ]] ||
         die 'invalid @atelier_restore value: expected always, never, or prompt'
+    [[ $mode != prompt || -n $client ]] || return 0
+
+    tmux_cmd wait-for -L atelier-restore-start
+    handled=$(tmux_cmd show-options -gqv @atelier_restore_handled 2>/dev/null || true)
+    started=$(tmux_cmd show-options -gqv @atelier_restore_started 2>/dev/null || true)
+    if [[ $handled != 0 || $started == 1 ]]; then
+        tmux_cmd wait-for -U atelier-restore-start
+        debug_log "restore start skipped client=$client handled=$handled started=$started"
+        return 0
+    fi
+    if ! tmux_cmd set-option -gq @atelier_restore_started 1; then
+        tmux_cmd wait-for -U atelier-restore-start
+        return 1
+    fi
+    tmux_cmd wait-for -U atelier-restore-start
+    debug_log "restore start client=$client mode=$mode"
+
     case $mode in
         always) command_restore "$client" ;;
         never) command_restore_discard "$client" ;;
         prompt)
-            [[ -n $client ]] || return 0
             cli=$(cli_path); qcli=$(quote_sh "$cli")
             command="$qcli popup-restore $(quote_sh "$client")"
-            tmux_cmd display-popup -c "$client" -E -w '55%' -h '20%' "$command"
+            if ! tmux_cmd display-popup -c "$client" -E -w '55%' -h '20%' "$command"; then
+                tmux_cmd set-option -gq @atelier_restore_started 0
+                return 1
+            fi
             ;;
     esac
 }

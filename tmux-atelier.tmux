@@ -107,4 +107,10 @@ tmux set-hook -g 'client-attached[90]' "$RESTORE_COMMAND"
 tmux set-hook -g 'session-created[91]' "$SESSION_ADOPT_COMMAND"
 tmux set-hook -g 'client-attached[91]' "$CLIENT_ADOPT_COMMAND"
 
+# The first client can attach before run-shell finishes loading this plugin.
+while IFS= read -r client; do
+    tmux run-shell -b "$QCLI restore-start $(quote_sh "$client")"
+    break
+done < <(tmux list-clients -F '#{client_name}')
+
 "$CLI" refresh-status
