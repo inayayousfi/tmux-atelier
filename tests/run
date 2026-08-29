@@ -261,6 +261,8 @@ assert_equal C-Space "$("$TMUX" show-options -gv prefix)" 'portable UI preserves
 assert_equal 2 "$("$TMUX" show-options -gv status)" 'status bar has two lines'
 assert_equal top "$("$TMUX" show-options -gv status-position)" 'portable UI preserves the status position'
 assert_equal on "$("$TMUX" show-options -gv mouse)" 'portable UI enables mouse interactions'
+assert_equal on "$("$TMUX" show-options -gv set-titles)" 'portable UI updates the outer terminal title'
+assert_equal '#W - #S@#{@atelier_destination}' "$("$TMUX" show-options -gv set-titles-string)" 'terminal title shows the tab followed by the workspace target'
 assert_equal prompt "$("$TMUX" show-options -gqv @atelier_restore)" 'portable UI defaults to prompted restoration'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +x ')" 'user-binding' 'portable UI preserves user key bindings'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +e ')" 'config-editor' 'portable UI preserves specialized new-window bindings'

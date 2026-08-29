@@ -8,4 +8,8 @@ set-option -g @atelier_restore prompt
 set-option -g @atelier_separator '│'
 set-option -g @atelier_tab_separator '│'
 
+# Outer terminal title: #W is the active tab, #S is the workspace, and
+# #{@atelier_destination} is local or the SSH destination.
+set-option -g @atelier_terminal_title '#W - #S@#{@atelier_destination}'
+
 run-shell /path/to/tmux-atelier/tmux-atelier.tmux

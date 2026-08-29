@@ -27,11 +27,13 @@ set_default_option @atelier_separator '│'
 set_default_option @atelier_tab_separator '│'
 set_default_option @atelier_restore prompt
 set_default_option @atelier_status_sides off
+set_default_option @atelier_terminal_title '#W - #S@#{@atelier_destination}'
 
 TAB_STYLE=$(tmux show-options -gqv @atelier_tab_style)
 TAB_ACTIVE_STYLE=$(tmux show-options -gqv @atelier_tab_active_style)
 ADD_STYLE=$(tmux show-options -gqv @atelier_add_style)
 TAB_SEPARATOR=$(tmux show-options -gqv @atelier_tab_separator)
+TERMINAL_TITLE=$(tmux show-options -gqv @atelier_terminal_title)
 TAB_SEPARATOR=${TAB_SEPARATOR//#/##}
 TABS_FORMAT="#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default]$TAB_SEPARATOR,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default]$TAB_SEPARATOR}#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
 if [[ $(tmux show-options -gqv @atelier_status_sides) == on ]]; then
@@ -54,6 +56,8 @@ tmux set-option -gq @atelier_tabs_format "$STATUS_FORMAT"
 tmux set-option -g mouse on
 tmux set-option -g status 2
 tmux set-option -g status-interval 5
+tmux set-option -g set-titles on
+tmux set-option -g set-titles-string "$TERMINAL_TITLE"
 tmux set-option -g 'status-format[0]' "$STATUS_FORMAT"
 tmux set-option -g 'status-format[1]' "#[range=user|new,$ADD_STYLE] + #[default,norange]"
 
