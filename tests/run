@@ -268,6 +268,8 @@ assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T pr
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +e ')" 'config-editor' 'portable UI preserves specialized new-window bindings'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" 'underscore' 'portable UI reads configurable workspace styles'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" '::' 'portable UI reads the configurable tab separator'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" ']::#{W:' 'tab list starts with its separator'
+assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[1]')" '│#[range=user|' 'workspace list starts with its separator'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'status-left' 'portable UI preserves the left status section'
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'status-right' 'portable UI preserves the right status section'
 

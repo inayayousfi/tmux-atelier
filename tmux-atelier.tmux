@@ -35,7 +35,7 @@ ADD_STYLE=$(tmux show-options -gqv @atelier_add_style)
 TAB_SEPARATOR=$(tmux show-options -gqv @atelier_tab_separator)
 TERMINAL_TITLE=$(tmux show-options -gqv @atelier_terminal_title)
 TAB_SEPARATOR=${TAB_SEPARATOR//#/##}
-TABS_FORMAT="#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default]$TAB_SEPARATOR,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default]$TAB_SEPARATOR}#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
+TABS_FORMAT="$TAB_SEPARATOR#{W:#[range=window|#{window_index} $TAB_STYLE] #I #W #[norange default]$TAB_SEPARATOR,#[range=window|#{window_index} $TAB_ACTIVE_STYLE] #I #W #[norange default]$TAB_SEPARATOR}#[range=user|new-tab $ADD_STYLE] + #[default,norange]"
 if [[ $(tmux show-options -gqv @atelier_status_sides) == on ]]; then
     STATUS_FORMAT="#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]$TABS_FORMAT#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]"
 else

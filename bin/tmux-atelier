@@ -941,6 +941,7 @@ status_line_for() {
     stopped_style=${stopped_style:-dim}
     add_style=${add_style:-bold}
     separator=${separator:-│}
+    line=$separator
     while IFS= read -r name; do
         [[ -n $name ]] || continue
         token="a$index"
