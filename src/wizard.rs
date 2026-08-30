@@ -399,12 +399,12 @@ fn choose_directory(
         };
         let prompt = display_path(home, &current, shell);
         let mut choices = vec![
-            ("< Select this folder".to_owned(), "select".to_owned()),
-            ("< Enter a path".to_owned(), "custom".to_owned()),
-            ("< Back".to_owned(), "back".to_owned()),
+            ("[ Select this folder ]".to_owned(), "select".to_owned()),
+            ("[ Enter a path ]".to_owned(), "custom".to_owned()),
+            ("[ Back to machines ]".to_owned(), "back".to_owned()),
         ];
         if current != "/" && !(is_windows_shell(shell) && is_windows_root(&current)) {
-            choices.push(("< Up".to_owned(), "up".to_owned()));
+            choices.push(("[ Up one level ]".to_owned(), "up".to_owned()));
         }
         for name in directories {
             choices.push((format!("{name}/"), format!("directory\t{name}")));

@@ -300,7 +300,7 @@ fn scripted_wizard_edits_and_renames_workspace() {
         "--detached",
     ]);
     let responses = env.scripted(&format!(
-        "choose\tLocal\nchoose\t< Enter a path\ninput\t{}\ninput\tafter\n",
+        "choose\tLocal\nchoose\t[ Enter a path ]\ninput\t{}\ninput\tafter\n",
         second.display()
     ));
     let log = env.root.path().join("interaction.log");
@@ -322,12 +322,12 @@ fn scripted_wizard_edits_and_renames_workspace() {
     assert!(!env.workspace("before").exists());
     let interactions = fs::read_to_string(log).unwrap();
     assert!(interactions.contains("choose\tMachine\tLocal\tCustom SSH destination"));
-    assert!(interactions.contains("< Enter a path"));
+    assert!(interactions.contains("[ Enter a path ]"));
 
     let collision = env.root.path().join("< Back");
     fs::create_dir(&collision).unwrap();
     let responses = env.scripted(
-        "choose\tLocal\nchoose\t< Back/\nchoose\t< Select this folder\ninput\tcollision\n",
+        "choose\tLocal\nchoose\t< Back/\nchoose\t[ Select this folder ]\ninput\tcollision\n",
     );
     let output = env
         .command(&env.cli)
@@ -359,7 +359,7 @@ fn wizard_recovers_and_remembers_ssh_destinations() {
     ]);
 
     let history = env
-        .scripted("choose\thistory@winhost\nchoose\t< Select this folder\ninput\tfrom-history\n");
+        .scripted("choose\thistory@winhost\nchoose\t[ Select this folder ]\ninput\tfrom-history\n");
     let history_log = env.root.path().join("history.log");
     let output = env
         .command(&env.cli)
@@ -381,7 +381,7 @@ fn wizard_recovers_and_remembers_ssh_destinations() {
         .contains("Modèles/"));
 
     let custom = env.scripted(
-        "choose\tCustom SSH destination\ninput\tremembered@app.example\nchoose\t< Select this folder\ninput\tremembered\n",
+        "choose\tCustom SSH destination\ninput\tremembered@app.example\nchoose\t[ Select this folder ]\ninput\tremembered\n",
     );
     let output = env
         .command(&env.cli)

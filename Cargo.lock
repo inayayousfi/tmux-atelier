@@ -490,6 +490,7 @@ name = "tmux-atelier"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "crossterm",
  "glob",
  "inquire",
  "tempfile",

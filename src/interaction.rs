@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{self, IsTerminal};
 
 use inquire::error::InquireError;
+use inquire::ui::{Attributes, RenderConfig};
 use inquire::{Confirm, Select, Text};
 
 use crate::Result;
@@ -13,6 +14,9 @@ pub trait Interaction: Send + Sync {
 }
 
 pub struct TerminalInteraction;
+
+const FALLBACK_PAGE_SIZE: usize = 15;
+const SELECT_RESERVED_ROWS: u16 = 3;
 
 #[derive(Clone)]
 struct Choice {
@@ -47,8 +51,13 @@ impl Interaction for TerminalInteraction {
                 label: label.clone(),
             })
             .collect();
-        Ok(cancelled(Select::new(prompt, choices).prompt_skippable())?
-            .map(|selected| selected.index))
+        Ok(cancelled(
+            Select::new(prompt, choices)
+                .with_page_size(select_page_size())
+                .with_render_config(select_render_config())
+                .prompt_skippable(),
+        )?
+        .map(|selected| selected.index))
     }
 
     fn input(&self, prompt: &str, initial: Option<&str>) -> Result<Option<String>> {
@@ -70,6 +79,28 @@ impl Interaction for TerminalInteraction {
     fn confirm(&self, prompt: &str) -> Result<Option<bool>> {
         cancelled(Confirm::new(prompt).with_default(false).prompt_skippable())
     }
+}
+
+fn select_page_size() -> usize {
+    crossterm::terminal::size()
+        .map(|(_, rows)| page_size_for_rows(rows))
+        .unwrap_or(FALLBACK_PAGE_SIZE)
+}
+
+fn page_size_for_rows(rows: u16) -> usize {
+    usize::from(rows.saturating_sub(SELECT_RESERVED_ROWS).max(1))
+}
+
+fn select_render_config() -> RenderConfig<'static> {
+    let mut config = RenderConfig::default();
+    config.highlighted_option_prefix = config
+        .highlighted_option_prefix
+        .with_content("  ❯")
+        .with_attr(Attributes::BOLD);
+    config.unhighlighted_option_prefix = config.unhighlighted_option_prefix.with_content("   ");
+    let selected = config.selected_option.unwrap_or_default();
+    config.selected_option = Some(selected.with_attr(selected.att | Attributes::BOLD));
+    config
 }
 
 fn cancelled<T>(result: std::result::Result<Option<T>, InquireError>) -> Result<Option<T>> {
@@ -146,5 +177,24 @@ impl Interaction for ScriptedInteraction {
                 "invalid scripted confirmation: {value}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_menu_uses_the_expanded_indented_style() {
+        let config = select_render_config();
+        assert_eq!(config.highlighted_option_prefix.content, "  ❯");
+        assert_eq!(config.unhighlighted_option_prefix.content, "   ");
+        assert!(config
+            .selected_option
+            .unwrap()
+            .att
+            .contains(Attributes::BOLD));
+        assert_eq!(page_size_for_rows(30), 27);
+        assert_eq!(page_size_for_rows(3), 1);
     }
 }
