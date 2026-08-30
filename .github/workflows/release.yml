@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            strip: strip
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            strip: strip
+          - platform: macos-arm64
+            runner: macos-14
+            strip: strip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and strip
+        run: |
+          cargo build --locked --release
+          ${{ matrix.strip }} target/release/tmux-atelier
+      - name: Package release
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          mkdir -p package/bin dist
+          cp target/release/tmux-atelier package/bin/tmux-atelier
+          cp tmux-atelier.tmux package/tmux-atelier.tmux
+          tar -C package -czf "dist/tmux-atelier-${PLATFORM}.tar.gz" bin/tmux-atelier tmux-atelier.tmux
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "tmux-atelier-${PLATFORM}.tar.gz" > "tmux-atelier-${PLATFORM}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "tmux-atelier-${PLATFORM}.tar.gz" > "tmux-atelier-${PLATFORM}.tar.gz.sha256")
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --generate-notes --verify-tag

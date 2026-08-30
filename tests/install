@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TEST_ROOT="$ROOT/.tmp/install.$$"
+RELEASES="$TEST_ROOT/releases"
+PAYLOAD="$TEST_ROOT/payload"
+TESTS=0
+
+cleanup() {
+    rm -rf "$TEST_ROOT"
+}
+trap cleanup EXIT
+
+fail() {
+    printf 'not ok %d - %s\n' "$((TESTS + 1))" "$*" >&2
+    exit 1
+}
+
+pass() {
+    ((++TESTS))
+    printf 'ok %d - %s\n' "$TESTS" "$1"
+}
+
+assert_equal() {
+    local expected=$1 actual=$2 message=$3
+    [[ $actual == "$expected" ]] || fail "$message (expected '$expected', got '$actual')"
+    pass "$message"
+}
+
+assert_file_content() {
+    local expected=$1 file=$2 message=$3 actual
+    [[ -f $file ]] || fail "$message (missing $file)"
+    actual=$(< "$file")
+    assert_equal "$expected" "$actual" "$message"
+}
+
+assert_executable_output() {
+    local expected=$1 file=$2 message=$3 actual
+    [[ -x $file ]] || fail "$message ($file is not executable)"
+    actual=$("$file")
+    assert_equal "$expected" "$actual" "$message"
+}
+
+make_release() {
+    local platform=$1 archive="$RELEASES/tmux-atelier-$1.tar.gz" checksum
+    printf '#!/bin/sh\nprintf "%s binary\\n"\n' "$platform" > "$PAYLOAD/bin/tmux-atelier"
+    printf '%s plugin\n' "$platform" > "$PAYLOAD/tmux-atelier.tmux"
+    chmod +x "$PAYLOAD/bin/tmux-atelier"
+    tar -C "$PAYLOAD" -czf "$archive" bin/tmux-atelier tmux-atelier.tmux
+    checksum=$(sha256sum "$archive")
+    checksum=${checksum%% *}
+    printf '%s  %s\n' "$checksum" "${archive##*/}" > "$archive.sha256"
+}
+
+run_installer() {
+    local os=$1 arch=$2 destination=$3
+    env \
+        TMUX_ATELIER_UNAME_S="$os" \
+        TMUX_ATELIER_UNAME_M="$arch" \
+        TMUX_ATELIER_RELEASE_BASE_URL="file://$RELEASES" \
+        TMUX_ATELIER_INSTALL_DIR="$destination" \
+        "$ROOT/install.sh"
+}
+
+mkdir -p "$RELEASES" "$PAYLOAD/bin"
+
+for platform in linux-x86_64 linux-aarch64 macos-arm64; do
+    make_release "$platform"
+done
+
+output=$(run_installer Linux x86_64 "$TEST_ROOT/linux-x86")
+assert_equal "run-shell '$TEST_ROOT/linux-x86/tmux-atelier.tmux'" "$output" 'Linux x86_64 maps to its release archive'
+assert_executable_output 'linux-x86_64 binary' "$TEST_ROOT/linux-x86/bin/tmux-atelier" 'Linux x86_64 installs its platform binary'
+
+output=$(run_installer Linux aarch64 "$TEST_ROOT/linux-arm")
+assert_equal "run-shell '$TEST_ROOT/linux-arm/tmux-atelier.tmux'" "$output" 'Linux aarch64 maps to its release archive'
+assert_executable_output 'linux-aarch64 binary' "$TEST_ROOT/linux-arm/bin/tmux-atelier" 'Linux aarch64 installs its platform binary'
+
+output=$(run_installer Darwin arm64 "$TEST_ROOT/macos-arm")
+assert_equal "run-shell '$TEST_ROOT/macos-arm/tmux-atelier.tmux'" "$output" 'macOS arm64 maps to its release archive'
+assert_executable_output 'macos-arm64 binary' "$TEST_ROOT/macos-arm/bin/tmux-atelier" 'macOS arm64 installs its platform binary'
+
+home="$TEST_ROOT/home"
+mkdir -p "$home"
+output=$(env -u XDG_CONFIG_HOME \
+    HOME="$home" \
+    TMUX_ATELIER_UNAME_S=Linux \
+    TMUX_ATELIER_UNAME_M=x86_64 \
+    TMUX_ATELIER_RELEASE_BASE_URL="file://$RELEASES" \
+    "$ROOT/install.sh")
+default_dir="$home/.config/tmux/tmux-atelier"
+assert_equal "run-shell '$default_dir/tmux-atelier.tmux'" "$output" 'unset XDG_CONFIG_HOME uses the documented default path'
+assert_file_content 'linux-x86_64 plugin' "$default_dir/tmux-atelier.tmux" 'default installation contains the plugin'
+
+xdg="$TEST_ROOT/xdg"
+tmux_config="$home/.tmux.conf"
+printf 'keep this config\n' > "$tmux_config"
+output=$(env \
+    HOME="$home" \
+    XDG_CONFIG_HOME="$xdg" \
+    TMUX_ATELIER_UNAME_S=Linux \
+    TMUX_ATELIER_UNAME_M=x86_64 \
+    TMUX_ATELIER_RELEASE_BASE_URL="file://$RELEASES" \
+    "$ROOT/install.sh")
+assert_equal "run-shell '$xdg/tmux/tmux-atelier/tmux-atelier.tmux'" "$output" 'XDG_CONFIG_HOME controls the default path'
+assert_file_content 'keep this config' "$tmux_config" 'installer does not modify tmux configuration'
+
+space_dir="$TEST_ROOT/path with spaces"
+output=$(run_installer Linux x86_64 "$space_dir")
+assert_equal "run-shell '$space_dir/tmux-atelier.tmux'" "$output" 'printed tmux command quotes an installation path with spaces'
+
+atomic_dir="$TEST_ROOT/atomic"
+mkdir -p "$atomic_dir/bin"
+printf 'old binary\n' > "$atomic_dir/bin/tmux-atelier"
+printf 'old plugin\n' > "$atomic_dir/tmux-atelier.tmux"
+printf 'old extra\n' > "$atomic_dir/old-extra"
+cp "$RELEASES/tmux-atelier-linux-x86_64.tar.gz.sha256" "$TEST_ROOT/good.sha256"
+printf '%064d  tmux-atelier-linux-x86_64.tar.gz\n' 0 > "$RELEASES/tmux-atelier-linux-x86_64.tar.gz.sha256"
+if run_installer Linux x86_64 "$atomic_dir" > "$TEST_ROOT/rejected.out" 2>&1; then
+    fail 'checksum mismatch is rejected'
+fi
+pass 'checksum mismatch is rejected'
+assert_file_content 'old binary' "$atomic_dir/bin/tmux-atelier" 'checksum rejection preserves the previous binary'
+assert_file_content 'old plugin' "$atomic_dir/tmux-atelier.tmux" 'checksum rejection preserves the previous plugin'
+
+cp "$TEST_ROOT/good.sha256" "$RELEASES/tmux-atelier-linux-x86_64.tar.gz.sha256"
+run_installer Linux x86_64 "$atomic_dir" > /dev/null
+assert_executable_output 'linux-x86_64 binary' "$atomic_dir/bin/tmux-atelier" 'verified release replaces the previous binary'
+[[ ! -e $atomic_dir/old-extra ]] || fail 'installation is replaced as a complete directory'
+pass 'installation is replaced as a complete directory'
+
+printf '1..%d\n' "$TESTS"
