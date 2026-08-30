@@ -5,7 +5,6 @@ use std::path::Path;
 use std::process::Command;
 
 use super::{ui, App};
-use crate::config::quote_sh;
 use crate::{err, process, wizard, workspace, Result};
 use workspace::Workspace;
 
@@ -248,24 +247,30 @@ pub(super) fn delete(app: &App, name: &str) -> Result<()> {
 
 pub(super) fn request_close(app: &App, name: &str, client: Option<&str>) -> Result<()> {
     workspace::validate_name(name)?;
-    let shell = format!("{} close {}", quote_sh(&app.cli_path()?), quote_sh(name));
-    ui::confirm_request(
-        app,
-        &format!("Stop workspace {name}? (y/n)"),
-        &shell,
-        client,
-    )
+    ui::popup_request(app, "confirm-close", name, client, "50%", "20%")
 }
 
 pub(super) fn request_delete(app: &App, name: &str, client: Option<&str>) -> Result<()> {
     workspace::validate_name(name)?;
-    let shell = format!("{} delete {}", quote_sh(&app.cli_path()?), quote_sh(name));
-    ui::confirm_request(
-        app,
-        &format!("Delete workspace {name}? (y/n)"),
-        &shell,
-        client,
-    )
+    ui::popup_request(app, "confirm-delete", name, client, "50%", "20%")
+}
+
+pub(super) fn confirm_close(app: &App, name: &str) -> Result<()> {
+    workspace::validate_name(name)?;
+    if app.confirm(&format!("Stop workspace {name}?"))? == Some(true) {
+        close(app, name)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn confirm_delete(app: &App, name: &str) -> Result<()> {
+    workspace::validate_name(name)?;
+    if app.confirm(&format!("Delete workspace {name}?"))? == Some(true) {
+        delete(app, name)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn request_rename(app: &App, name: &str, client: Option<&str>) -> Result<()> {
@@ -275,7 +280,7 @@ pub(super) fn request_rename(app: &App, name: &str, client: Option<&str>) -> Res
 
 pub(super) fn popup_rename(app: &App, old: &str) -> Result<()> {
     workspace::validate_name(old)?;
-    let Some(new) = process::read_line("New workspace name: ", Some(old))? else {
+    let Some(new) = app.input("New workspace name", Some(old))? else {
         return Ok(());
     };
     rename(app, old, &new)
@@ -284,11 +289,11 @@ pub(super) fn popup_rename(app: &App, old: &str) -> Result<()> {
 pub(super) fn popup_new(app: &App) -> Result<()> {
     let client = env::var("TMUX_ATELIER_CLIENT").unwrap_or_default();
     loop {
-        let Some(target) = wizard::choose_target(app)? else {
+        let Some(target) = wizard::choose_target(app, app.interaction.as_ref())? else {
             return Ok(());
         };
         let suggested = workspace::normalise_name(app, &target.path, "", "");
-        let Some(name) = process::read_line("Workspace name: ", Some(&suggested))? else {
+        let Some(name) = app.input("Workspace name", Some(&suggested))? else {
             continue;
         };
         let args = [
@@ -312,14 +317,14 @@ pub(super) fn popup_new(app: &App) -> Result<()> {
 pub(super) fn popup_edit(app: &App, name: &str) -> Result<()> {
     workspace::validate_name(name)?;
     workspace::read(app, name)?;
-    let Some(target) = wizard::choose_target(app)? else {
+    let Some(target) = wizard::choose_target(app, app.interaction.as_ref())? else {
         return Ok(());
     };
     let suggested = workspace::normalise_name(app, &target.path, name, name);
     app.debug(&format!(
         "workspace-edit name-prompt name={name} suggested={suggested}"
     ))?;
-    let Some(new) = process::read_line("Workspace name: ", Some(&suggested))? else {
+    let Some(new) = app.input("Workspace name", Some(&suggested))? else {
         return Ok(());
     };
     rename(app, name, &new)?;

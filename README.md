@@ -1,6 +1,3 @@
-Written by inayayousfi, typed by GPT-5.6-SOL running in OpenCode.
-Every call here is inayayousfi's, and no agent acted on its own.
-
 # tmux-atelier
 
 tmux-atelier turns tmux sessions into local or remote workspaces. tmux keeps shells and processes alive. OpenSSH handles remote connections. The Rust binary manages creation, navigation, restoration, and the metadata needed to reopen a target. A small shell adapter connects it to tmux.
@@ -9,7 +6,9 @@ A tmux session is a workspace, a window is a tab, and a pane is a split.
 
 ## Dependencies
 
-Running tmux-atelier requires tmux, OpenSSH, fzf, and Bash for the tmux adapter. Rust and ShellCheck are only needed for development.
+Running tmux-atelier requires tmux. OpenSSH is also required when using remote workspaces. The plugin adapter is POSIX `sh` and has no Bash or fzf runtime dependency.
+
+Building from source requires Rust 1.89 or newer. Bash and ShellCheck are used for the installer and development checks.
 
 ## Installation
 
@@ -134,13 +133,13 @@ Editing a live workspace updates the saved definition and the session metadata u
 
 The first status line shows the windows in the active session and ends with a `+` button for creating a tab on the same target. New tabs are appended after the last existing tab, even when an earlier numeric index is free.
 
-The second status line shows saved workspaces and native tmux sessions in creation order. By default, the current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens an FZF menu for editing, stopping, or deleting it. Stopped workspaces also offer an explicit open action. Right-clicking a tab opens an FZF menu for renaming or closing it. Destructive actions require confirmation.
+The second status line shows saved workspaces and native tmux sessions in creation order. By default, the current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens a menu for editing, stopping, or deleting it. Stopped workspaces also offer an explicit open action. Right-clicking a tab opens a menu for renaming or closing it. Destructive actions require confirmation.
 
 The outer terminal title follows the active tab and workspace target using `tab - workspace@destination`. Its default format is `#W - #S@#{@atelier_destination}`, where `#W` expands to the active tab name, `#S` expands to the workspace name, and `#{@atelier_destination}` expands to `local` or the SSH destination. Set `@atelier_terminal_title` before loading the plugin to customize this tmux format string. Set `@atelier_separator` and `@atelier_tab_separator` to change the separators shown before, between, and after workspaces and tabs. Advanced tmux styles are available through `@atelier_workspace_active_style`, `@atelier_workspace_live_style`, `@atelier_workspace_stopped_style`, `@atelier_tab_style`, `@atelier_tab_active_style`, and `@atelier_add_style`.
 
 The creation popup uses one machine list containing the local machine, concrete SSH aliases found through `Host` and `Include` directives in `~/.ssh/config`, and a custom SSH destination. Aliases show the user, hostname, and port resolved by `ssh -G`; custom destinations accept an alias or `user@host`.
 
-After choosing a machine, the directory browser starts at its home directory. It can select the current directory, descend into normal or hidden directories, follow directory symlinks, move up to `/`, or return to the machine screen. Typing a relative, `~/...`, or absolute path directly into the FZF prompt creates missing directories recursively and selects the resulting path. Remote directories are created and checked through SSH. The final prompt proposes a workspace name derived from the selected directory and allows editing it.
+After choosing a machine, the directory browser starts at its home directory. It can select the current directory, descend into normal or hidden directories, follow directory symlinks, move up to `/`, or return to the machine screen. The `Enter a path` action accepts a relative, `~/...`, or absolute path, creates missing directories recursively, and selects the result. Remote directories are created and checked through SSH. The final prompt proposes a workspace name derived from the selected directory and allows editing it.
 
 tmux-atelier finds the keys currently assigned to native window, split, and rename actions, then replaces only their commands with workspace-aware equivalents. It does not choose the keys. With tmux's default key table, the result is:
 
@@ -203,7 +202,7 @@ tmux show-options -t NAME: @atelier_path
 
 ## Development
 
-The Rust implementation is divided by responsibility: command lifecycle, tabs and panes, status and menus, restoration and adoption, workspace persistence, snapshot persistence, process adapters, and the target wizard. The application context carries configured state paths and adapters through those modules.
+The Rust implementation is divided by responsibility: typed CLI commands, interaction, tmux configuration, workspace lifecycle, tabs and panes, restoration and adoption, persistence, process adapters, and the target wizard. The application context carries configured state paths and adapters through those modules.
 
 Build and run the Rust checks with:
 
@@ -216,16 +215,17 @@ cargo test --all-targets
 
 ## Tests
 
-The test suite uses an isolated tmux server, state directory, and fake SSH client. It does not touch real sessions or definitions.
+The Rust process suite uses isolated tmux servers, state directories, a fake SSH client, and scripted interaction. It does not touch real sessions or definitions. The installer remains covered at its shell boundary.
 
 ```sh
-./tests/run
+cargo test --all-targets
 ./tests/install
 ```
 
 Run the static checks with:
 
 ```sh
-bash -n install.sh tmux-atelier.tmux tests/install tests/run
-shellcheck install.sh tmux-atelier.tmux tests/install tests/run tests/fixtures/fzf tests/fixtures/ssh tests/fixtures/tmux tests/fixtures/tmux-log tests/fixtures/tmux-ui
+bash -n install.sh tests/install tests/fixtures/ssh tests/fixtures/tmux
+sh -n tmux-atelier.tmux
+shellcheck install.sh tmux-atelier.tmux tests/install tests/fixtures/ssh tests/fixtures/tmux
 ```

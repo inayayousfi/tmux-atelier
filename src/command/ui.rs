@@ -170,7 +170,7 @@ fn range_name(app: &App, token: &str) -> String {
 }
 
 fn show_new_popup(app: &App, client: Option<&str>) -> Result<()> {
-    let command = format!("{} popup-new", quote_sh(&app.cli_path()?));
+    let command = format!("{} internal popup-new", quote_sh(&app.cli_path()?));
     let mut owned = vec!["display-popup".to_owned()];
     if let Some(client) = client.filter(|value| !value.is_empty()) {
         owned.extend([
@@ -207,7 +207,7 @@ pub(super) fn status_menu(app: &App, token: &str, client: Option<&str>) -> Resul
 pub(super) fn menu(app: &App, name: &str, client: Option<&str>) -> Result<()> {
     workspace::validate_name(name)?;
     let command = format!(
-        "{} popup-workspace-menu {}",
+        "{} internal popup-workspace-menu {}",
         quote_sh(&app.cli_path()?),
         quote_sh(name)
     );
@@ -239,16 +239,13 @@ pub(super) fn menu(app: &App, name: &str, client: Option<&str>) -> Result<()> {
     ))
 }
 
-fn choose_action(prompt: &str, choices: &str) -> Result<Option<String>> {
-    process::pipe(
-        "fzf",
-        [
-            format!("--prompt={prompt} > "),
-            "--height=100%".into(),
-            "--border".into(),
-            "--no-info".into(),
-        ],
-        choices,
+fn choose_action(app: &App, prompt: &str, choices: &[&str]) -> Result<Option<usize>> {
+    app.choose(
+        prompt,
+        &choices
+            .iter()
+            .map(|choice| (*choice).into())
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -256,29 +253,30 @@ pub(super) fn popup_workspace_menu(app: &App, name: &str) -> Result<()> {
     workspace::validate_name(name)?;
     let client = env::var("TMUX_ATELIER_CLIENT").unwrap_or_default();
     app.debug(&format!(
-        "workspace-fzf started name={name} inherited_client={client}"
+        "workspace-menu started name={name} inherited_client={client}"
     ))?;
-    let mut choices = String::new();
+    let mut choices = Vec::new();
     if !workspace::session_exists(app, name) {
-        choices.push_str("Open workspace\n");
+        choices.push("Open workspace");
     }
-    choices.push_str("Edit workspace\n");
+    choices.push("Edit workspace");
     if workspace::session_exists(app, name) {
-        choices.push_str("Stop workspace\n");
+        choices.push("Stop workspace");
     }
     if app.workspaces.join(name).is_file() {
-        choices.push_str("Delete workspace\n");
+        choices.push("Delete workspace");
     }
-    let Some(action) = choose_action(name, &choices)? else {
+    let Some(index) = choose_action(app, name, &choices)? else {
         app.debug(&format!(
-            "workspace-fzf cancelled name={name} inherited_client={client}"
+            "workspace-menu cancelled name={name} inherited_client={client}"
         ))?;
         return Ok(());
     };
+    let action = choices[index];
     app.debug(&format!(
-        "workspace-fzf selected name={name} action={action} inherited_client={client}"
+        "workspace-menu selected name={name} action={action} inherited_client={client}"
     ))?;
-    match action.as_str() {
+    match action {
         "Open workspace" => lifecycle::open(app, name, None),
         "Edit workspace" => popup_workspace_edit_menu(app, name),
         "Stop workspace" => defer_request(app, "request-close", name, &client),
@@ -290,13 +288,15 @@ pub(super) fn popup_workspace_menu(app: &App, name: &str) -> Result<()> {
 fn popup_workspace_edit_menu(app: &App, name: &str) -> Result<()> {
     let client = env::var("TMUX_ATELIER_CLIENT").unwrap_or_default();
     let choices = if app.workspaces.join(name).is_file() {
-        "Change target\nRename workspace\n"
+        vec!["Change target", "Rename workspace"]
     } else {
-        "Rename workspace\n"
+        vec!["Rename workspace"]
     };
-    match choose_action(&format!("Edit {name}"), choices)?.as_deref() {
-        Some("Change target") => lifecycle::popup_edit(app, name),
-        Some("Rename workspace") => defer_request(app, "request-rename", name, &client),
+    match choose_action(app, &format!("Edit {name}"), &choices)? {
+        Some(index) if choices[index] == "Change target" => lifecycle::popup_edit(app, name),
+        Some(index) if choices[index] == "Rename workspace" => {
+            defer_request(app, "request-rename", name, &client)
+        }
         _ => Ok(()),
     }
 }
@@ -309,12 +309,13 @@ pub(super) fn popup_tab_menu(app: &App, window: &str) -> Result<()> {
     )?;
     let client = env::var("TMUX_ATELIER_CLIENT").unwrap_or_default();
     app.debug(&format!(
-        "tab-fzf started window={window} name={name} inherited_client={client}"
+        "tab-menu started window={window} name={name} inherited_client={client}"
     ))?;
-    let Some(action) = choose_action(&name, "Rename tab\nClose tab\n")? else {
+    let choices = ["Rename tab", "Close tab"];
+    let Some(index) = choose_action(app, &name, &choices)? else {
         return Ok(());
     };
-    match action.as_str() {
+    match choices[index] {
         "Rename tab" => defer_request(app, "request-tab-rename", window, &client),
         "Close tab" => defer_request(app, "request-tab-close", window, &client),
         _ => Ok(()),
@@ -323,7 +324,7 @@ pub(super) fn popup_tab_menu(app: &App, window: &str) -> Result<()> {
 
 fn defer_request(app: &App, request: &str, target: &str, client: &str) -> Result<()> {
     let mut command = format!(
-        "{} {request} {}",
+        "{} internal {request} {}",
         quote_sh(&app.cli_path()?),
         quote_sh(target)
     );
@@ -350,7 +351,7 @@ pub(super) fn popup_request(
     height: &str,
 ) -> Result<()> {
     let command = format!(
-        "{} {subcommand} {}",
+        "{} internal {subcommand} {}",
         quote_sh(&app.cli_path()?),
         quote_sh(target)
     );
@@ -366,20 +367,5 @@ pub(super) fn popup_request(
         height.into(),
         command,
     ]);
-    process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
-}
-
-pub(super) fn confirm_request(
-    app: &App,
-    prompt: &str,
-    shell_command: &str,
-    client: Option<&str>,
-) -> Result<()> {
-    let command = format!("run-shell -b \"{shell_command}\"");
-    let mut owned = vec!["confirm-before".to_owned()];
-    if let Some(client) = client.filter(|value| !value.is_empty()) {
-        owned.extend(["-t".into(), client.into()]);
-    }
-    owned.extend(["-p".into(), prompt.into(), command]);
     process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
 }

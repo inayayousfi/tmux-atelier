@@ -1,3 +1,4 @@
+mod configure;
 mod lifecycle;
 mod restore;
 mod tabs;
@@ -6,11 +7,14 @@ mod ui;
 use std::fs::{self, OpenOptions};
 use std::ops::Deref;
 
+use crate::app::{Command, InternalCommand};
 use crate::config::Config;
+use crate::interaction::{self, Interaction};
 use crate::{err, process, snapshot, workspace, Result};
 
 pub(crate) struct App {
     config: Config,
+    pub(crate) interaction: Box<dyn Interaction>,
 }
 
 impl Deref for App {
@@ -25,83 +29,108 @@ impl App {
     pub(crate) fn from_env() -> Result<Self> {
         Ok(Self {
             config: Config::from_env()?,
+            interaction: interaction::from_env(),
         })
     }
 
-    pub(crate) fn dispatch(&self, command: &str, args: &[String]) -> Result<()> {
+    fn choose(&self, prompt: &str, options: &[String]) -> Result<Option<usize>> {
+        self.interaction.choose(prompt, options)
+    }
+
+    fn input(&self, prompt: &str, initial: Option<&str>) -> Result<Option<String>> {
+        self.interaction.input(prompt, initial)
+    }
+
+    fn confirm(&self, prompt: &str) -> Result<Option<bool>> {
+        self.interaction.confirm(prompt)
+    }
+
+    pub(crate) fn dispatch(&self, command: Command) -> Result<()> {
         match command {
-            "new" if (1..=3).contains(&args.len()) => lifecycle::new(self, args, None),
-            "open" if (1..=2).contains(&args.len()) => {
-                lifecycle::open(self, &args[0], args.get(1).map(String::as_str))
+            Command::New {
+                target,
+                name,
+                detached,
+            } => {
+                let mut args = vec![target];
+                if let Some(name) = name {
+                    args.push(name);
+                }
+                if detached {
+                    args.push("--detached".into());
+                }
+                lifecycle::new(self, &args, None)
             }
-            "window" if args.len() <= 1 => tabs::window(self, args.first().map(String::as_str)),
-            "split" if (1..=2).contains(&args.len()) => {
-                tabs::split(self, &args[0], args.get(1).map(String::as_str))
+            Command::Open { name, detached } => {
+                lifecycle::open(self, &name, detached.then_some("--detached"))
             }
-            "rename" if args.len() == 2 => lifecycle::rename(self, &args[0], &args[1]),
-            "edit" if args.len() == 2 => lifecycle::edit(self, &args[0], &args[1], None),
-            "close" if args.len() == 1 => lifecycle::close(self, &args[0]),
-            "delete" if args.len() == 1 => lifecycle::delete(self, &args[0]),
-            "popup-new" if args.is_empty() => lifecycle::popup_new(self),
-            "popup-workspace-menu" if args.len() == 1 => ui::popup_workspace_menu(self, &args[0]),
-            "popup-tab-menu" if args.len() == 1 => ui::popup_tab_menu(self, &args[0]),
-            "popup-restore" if args.len() <= 1 => {
-                restore::popup_restore(self, args.first().map(String::as_str))
+            Command::Window { session } => tabs::window(self, session.as_deref()),
+            Command::Split { orientation, pane } => {
+                tabs::split(self, orientation.as_str(), pane.as_deref())
             }
-            "popup-tab-rename" if args.len() == 1 => tabs::popup_rename(self, &args[0]),
-            "popup-rename" if args.len() == 1 => lifecycle::popup_rename(self, &args[0]),
-            "popup-edit" if args.len() == 1 => lifecycle::popup_edit(self, &args[0]),
-            "refresh-status" if args.is_empty() => ui::refresh_status(self),
-            "status-click" if (1..=3).contains(&args.len()) => ui::status_click(
-                self,
-                &args[0],
-                args.get(1).map(String::as_str),
-                args.get(2).map(String::as_str),
-            ),
-            "status-menu" if (1..=2).contains(&args.len()) => {
-                ui::status_menu(self, &args[0], args.get(1).map(String::as_str))
+            Command::Rename { old, new } => lifecycle::rename(self, &old, &new),
+            Command::Edit { name, target } => lifecycle::edit(self, &name, &target, None),
+            Command::Close { name } => lifecycle::close(self, &name),
+            Command::Delete { name } => lifecycle::delete(self, &name),
+            Command::Internal { command } => self.dispatch_internal(command),
+        }
+    }
+
+    fn dispatch_internal(&self, command: InternalCommand) -> Result<()> {
+        match command {
+            InternalCommand::Configure { root, cli } => configure::run(self, &root, &cli),
+            InternalCommand::PopupNew => lifecycle::popup_new(self),
+            InternalCommand::PopupWorkspaceMenu { name } => ui::popup_workspace_menu(self, &name),
+            InternalCommand::PopupTabMenu { window } => ui::popup_tab_menu(self, &window),
+            InternalCommand::PopupRestore { client } => {
+                restore::popup_restore(self, client.as_deref())
             }
-            "menu" if (1..=2).contains(&args.len()) => {
-                ui::menu(self, &args[0], args.get(1).map(String::as_str))
+            InternalCommand::PopupTabRename { window } => tabs::popup_rename(self, &window),
+            InternalCommand::PopupRename { name } => lifecycle::popup_rename(self, &name),
+            InternalCommand::PopupEdit { name } => lifecycle::popup_edit(self, &name),
+            InternalCommand::RefreshStatus => ui::refresh_status(self),
+            InternalCommand::StatusClick {
+                token,
+                client,
+                session,
+            } => ui::status_click(self, &token, client.as_deref(), session.as_deref()),
+            InternalCommand::StatusMenu { token, client } => {
+                ui::status_menu(self, &token, client.as_deref())
             }
-            "request-close" if (1..=2).contains(&args.len()) => {
-                lifecycle::request_close(self, &args[0], args.get(1).map(String::as_str))
+            InternalCommand::Menu { name, client } => ui::menu(self, &name, client.as_deref()),
+            InternalCommand::RequestClose { name, client } => {
+                lifecycle::request_close(self, &name, client.as_deref())
             }
-            "request-rename" if (1..=2).contains(&args.len()) => {
-                lifecycle::request_rename(self, &args[0], args.get(1).map(String::as_str))
+            InternalCommand::RequestRename { name, client } => {
+                lifecycle::request_rename(self, &name, client.as_deref())
             }
-            "request-tab-rename" if (1..=2).contains(&args.len()) => {
-                tabs::request_rename(self, &args[0], args.get(1).map(String::as_str))
+            InternalCommand::RequestTabRename { window, client } => {
+                tabs::request_rename(self, &window, client.as_deref())
             }
-            "request-tab-close" if (1..=2).contains(&args.len()) => {
-                tabs::request_close(self, &args[0], args.get(1).map(String::as_str))
+            InternalCommand::RequestTabClose { window, client } => {
+                tabs::request_close(self, &window, client.as_deref())
             }
-            "tab-close" if args.len() == 1 => tabs::close(self, &args[0]),
-            "request-delete" if (1..=2).contains(&args.len()) => {
-                lifecycle::request_delete(self, &args[0], args.get(1).map(String::as_str))
+            InternalCommand::TabClose { window } => tabs::close(self, &window),
+            InternalCommand::RequestDelete { name, client } => {
+                lifecycle::request_delete(self, &name, client.as_deref())
             }
-            "snapshot" if args.is_empty() => self.snapshot("", ""),
-            "restore-arm" if args.is_empty() => restore::arm(self),
-            "restore-start" if args.len() <= 1 => {
-                restore::start(self, args.first().map(String::as_str))
+            InternalCommand::ConfirmClose { name } => lifecycle::confirm_close(self, &name),
+            InternalCommand::ConfirmDelete { name } => lifecycle::confirm_delete(self, &name),
+            InternalCommand::ConfirmTabClose { window } => tabs::confirm_close(self, &window),
+            InternalCommand::Snapshot => self.snapshot("", ""),
+            InternalCommand::RestoreArm => restore::arm(self),
+            InternalCommand::RestoreStart { client } => restore::start(self, client.as_deref()),
+            InternalCommand::RestoreAttached => restore::attached(self),
+            InternalCommand::Restore { client } => restore::run(self, client.as_deref()),
+            InternalCommand::RestoreDiscard => restore::discard(self, None),
+            InternalCommand::AdoptSession { session, client } => {
+                restore::adopt(self, &session, client.as_deref())
             }
-            "restore-attached" if args.is_empty() => restore::attached(self),
-            "restore" if args.len() <= 1 => restore::run(self, args.first().map(String::as_str)),
-            "restore-discard" if args.is_empty() => restore::discard(self, None),
-            "adopt-session" if (1..=2).contains(&args.len()) => {
-                restore::adopt(self, &args[0], args.get(1).map(String::as_str))
-            }
-            "debug-path" if args.is_empty() => {
+            InternalCommand::DebugPath => {
                 println!("{}", self.debug_log.display());
                 Ok(())
             }
-            "debug-clear" if args.is_empty() => self.debug_clear(),
-            "help" | "-h" | "--help" if args.is_empty() => {
-                Self::usage();
-                Ok(())
-            }
-            known if is_known(known) => Err(err(format!("usage: tmux-atelier {known}"))),
-            _ => Err(err(format!("unknown command: {command}"))),
+            InternalCommand::DebugClear => self.debug_clear(),
         }
     }
 
@@ -140,53 +169,6 @@ impl App {
         fs::set_permissions(&self.debug_log, fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
-
-    pub(crate) fn usage() {
-        println!("Usage: tmux-atelier COMMAND [ARGUMENTS]\n\nCommands:\n  new TARGET [NAME] [--detached]\n  open NAME [--detached]\n  window [SESSION]\n  split vertical|horizontal [PANE]\n  rename OLD NEW\n  edit NAME TARGET\n  close NAME\n  delete NAME\n  popup-new\n  popup-workspace-menu NAME\n  popup-tab-menu WINDOW_ID\n  snapshot\n  restore-start [CLIENT]\n  adopt-session SESSION [CLIENT]\n  refresh-status");
-    }
-}
-
-fn is_known(command: &str) -> bool {
-    matches!(
-        command,
-        "new"
-            | "open"
-            | "window"
-            | "split"
-            | "rename"
-            | "edit"
-            | "close"
-            | "delete"
-            | "popup-new"
-            | "popup-workspace-menu"
-            | "popup-tab-menu"
-            | "popup-restore"
-            | "popup-tab-rename"
-            | "popup-rename"
-            | "popup-edit"
-            | "refresh-status"
-            | "status-click"
-            | "status-menu"
-            | "menu"
-            | "request-close"
-            | "request-rename"
-            | "request-tab-rename"
-            | "request-tab-close"
-            | "tab-close"
-            | "request-delete"
-            | "snapshot"
-            | "restore-arm"
-            | "restore-start"
-            | "restore-attached"
-            | "restore"
-            | "restore-discard"
-            | "adopt-session"
-            | "debug-path"
-            | "debug-clear"
-            | "help"
-            | "-h"
-            | "--help"
-    )
 }
 
 fn shell_option(app: &App, session: &str, destination: &str) -> String {

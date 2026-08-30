@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-use std::io::{self, Write};
 use std::process::{Command, Output, Stdio};
 
 use crate::config::{quote_powershell, quote_sh, Config};
@@ -53,29 +52,6 @@ where
         .and_then(|out| out.status.success().then_some(out.stdout))
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .map(|text| text.trim_end_matches('\n').to_owned())
-}
-
-pub fn pipe<I, S>(program: &str, args: I, input: &str) -> Result<Option<String>>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    child.stdin.take().unwrap().write_all(input.as_bytes())?;
-    let result = child.wait_with_output()?;
-    if result.status.success() {
-        Ok(Some(
-            String::from_utf8(result.stdout)?
-                .trim_end_matches('\n')
-                .to_owned(),
-        ))
-    } else {
-        Ok(None)
-    }
 }
 
 pub fn tmux(config: &Config, args: &[&str]) -> Result<()> {
@@ -154,29 +130,4 @@ pub fn remote_shell_command(
     command.push(' ');
     command.push_str(&quote_sh(&remote));
     Ok(command)
-}
-
-pub fn read_line(prompt: &str, initial: Option<&str>) -> Result<Option<String>> {
-    if atty_stdin() {
-        let mut editor = rustyline::DefaultEditor::new()?;
-        match editor.readline_with_initial(prompt, (initial.unwrap_or_default(), "")) {
-            Ok(line) => Ok(Some(line)),
-            Err(
-                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
-            ) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
-    } else {
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(line.trim_end_matches(['\r', '\n']).to_owned()))
-        }
-    }
-}
-
-fn atty_stdin() -> bool {
-    use std::io::IsTerminal;
-    io::stdin().is_terminal()
 }

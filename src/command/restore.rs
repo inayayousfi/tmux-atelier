@@ -307,7 +307,7 @@ pub(super) fn start(app: &App, client: Option<&str>) -> Result<()> {
             let client = client.unwrap();
             name_bootstrap(app, client)?;
             let command = format!(
-                "{} popup-restore {}",
+                "{} internal popup-restore {}",
                 quote_sh(&app.cli_path()?),
                 quote_sh(client)
             );

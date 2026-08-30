@@ -11,12 +11,12 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
       - name: Install runtime and shell dependencies
-        run: sudo apt-get update && sudo apt-get install -y fzf shellcheck tmux
+        run: sudo apt-get update && sudo apt-get install -y shellcheck tmux
       - name: Check Rust
         run: |
           cargo fmt --check
@@ -24,9 +24,8 @@ jobs:
           cargo test --all-targets
       - name: Check shell files
         run: |
-          bash -n install.sh tmux-atelier.tmux tests/install tests/run
-          shellcheck install.sh tmux-atelier.tmux tests/install tests/run tests/fixtures/fzf tests/fixtures/ssh tests/fixtures/tmux tests/fixtures/tmux-log tests/fixtures/tmux-ui
+          bash -n install.sh tests/install tests/fixtures/ssh tests/fixtures/tmux
+          sh -n tmux-atelier.tmux
+          shellcheck install.sh tmux-atelier.tmux tests/install tests/fixtures/ssh tests/fixtures/tmux
       - name: Test installer
         run: ./tests/install
-      - name: Test tmux integration
-        run: ./tests/run

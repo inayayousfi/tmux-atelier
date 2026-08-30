@@ -5,8 +5,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use regex::Regex;
-
 use crate::config::Config;
 use crate::process;
 use crate::{err, Result};
@@ -64,8 +62,14 @@ pub fn validate_value(label: &str, value: &str) -> Result<()> {
 
 pub fn validate_destination(value: &str) -> Result<()> {
     validate_value("destination", value)?;
-    let regex = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_.@-]*$").unwrap();
-    if value == "local" || regex.is_match(value) {
+    let valid = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'@' | b'-'));
+    if value == "local" || valid {
         Ok(())
     } else {
         Err(err(format!("invalid OpenSSH destination: {value}")))

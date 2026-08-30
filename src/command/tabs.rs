@@ -1,5 +1,4 @@
 use super::{ui, App};
-use crate::config::quote_sh;
 use crate::{err, process, workspace, Result};
 
 pub(super) fn window(app: &App, session: Option<&str>) -> Result<()> {
@@ -74,7 +73,7 @@ pub(super) fn popup_rename(app: &App, window: &str) -> Result<()> {
         app,
         &["display-message", "-p", "-t", window, "#{window_name}"],
     )?;
-    let Some(new) = process::read_line("New tab name: ", Some(&name))? else {
+    let Some(new) = app.input("New tab name", Some(&name))? else {
         return Ok(());
     };
     workspace::validate_value("tab name", &new)?;
@@ -84,16 +83,20 @@ pub(super) fn popup_rename(app: &App, window: &str) -> Result<()> {
 
 pub(super) fn request_close(app: &App, window: &str, client: Option<&str>) -> Result<()> {
     validate_window(window)?;
+    ui::popup_request(app, "confirm-tab-close", window, client, "50%", "20%")
+}
+
+pub(super) fn confirm_close(app: &App, window: &str) -> Result<()> {
+    validate_window(window)?;
     let name = process::tmux_output(
         app,
         &["display-message", "-p", "-t", window, "#{window_name}"],
     )?;
-    let shell = format!(
-        "{} tab-close {}",
-        quote_sh(&app.cli_path()?),
-        quote_sh(window)
-    );
-    ui::confirm_request(app, &format!("Close tab {name}? (y/n)"), &shell, client)
+    if app.confirm(&format!("Close tab {name}?"))? == Some(true) {
+        close(app, window)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn close(app: &App, window: &str) -> Result<()> {

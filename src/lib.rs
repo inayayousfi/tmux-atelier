@@ -19,6 +19,7 @@ pub fn err(message: impl Into<String>) -> Error {
 pub mod app;
 pub(crate) mod command;
 pub mod config;
+pub mod interaction;
 pub mod process;
 pub mod snapshot;
 pub mod wizard;

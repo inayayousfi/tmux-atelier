@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use glob::glob;
 
 use crate::config::{quote_powershell, quote_sh, Config};
+use crate::interaction::Interaction;
 use crate::process;
 use crate::workspace::{self, is_windows_shell};
 use crate::{err, Result};
@@ -17,9 +18,9 @@ pub struct Target {
     pub shell: String,
 }
 
-pub fn choose_target(config: &Config) -> Result<Option<Target>> {
+pub fn choose_target(config: &Config, interaction: &dyn Interaction) -> Result<Option<Target>> {
     loop {
-        let Some(machine) = choose_machine(config)? else {
+        let Some(machine) = choose_machine(config, interaction)? else {
             return Ok(None);
         };
         let mut columns = machine.split('\t');
@@ -35,7 +36,7 @@ pub fn choose_target(config: &Config) -> Result<Option<Target>> {
             ),
             "custom" => {
                 let Some(input) =
-                    process::read_line("OpenSSH destination (user@host or alias): ", None)?
+                    interaction.input("OpenSSH destination (user@host or alias)", None)?
                 else {
                     continue;
                 };
@@ -58,7 +59,7 @@ pub fn choose_target(config: &Config) -> Result<Option<Target>> {
             },
             _ => continue,
         };
-        match choose_directory(config, &destination, &home, &shell)? {
+        match choose_directory(config, interaction, &destination, &home, &shell)? {
             DirectoryChoice::Selected(path) => {
                 return Ok(Some(Target {
                     destination,
@@ -72,8 +73,14 @@ pub fn choose_target(config: &Config) -> Result<Option<Target>> {
     }
 }
 
-fn choose_machine(config: &Config) -> Result<Option<String>> {
-    let mut choices = String::from("local\tLocal\tlocal\ncustom\tCustom SSH destination\t\n");
+fn choose_machine(config: &Config, interaction: &dyn Interaction) -> Result<Option<String>> {
+    let mut choices = vec![
+        ("Local".to_owned(), "local\tLocal\tlocal".to_owned()),
+        (
+            "Custom SSH destination".to_owned(),
+            "custom\tCustom SSH destination\t".to_owned(),
+        ),
+    ];
     let home = env::var_os("HOME").ok_or("HOME is not configured")?;
     let mut aliases = Vec::new();
     aliases_from(
@@ -85,30 +92,32 @@ fn choose_machine(config: &Config) -> Result<Option<String>> {
     aliases.dedup();
     for alias in aliases {
         if let Some(choice) = alias_choice(config, &alias)? {
-            choices.push_str(&choice);
-            choices.push('\n');
+            let label = choice
+                .split_once('\t')
+                .and_then(|(_, rest)| rest.rsplit_once('\t').map(|(label, _)| label))
+                .unwrap_or(&alias)
+                .to_owned();
+            choices.push((label, choice));
         }
     }
     config.debug(&format!(
-        "new-workspace machine-fzf started rows={}",
-        crate::config::shell_debug(&choices)
+        "new-workspace machine-selection started rows={}",
+        choices.len()
     ))?;
-    let args = [
-        "--delimiter=\t",
-        "--with-nth=2",
-        "--prompt=Machine > ",
-        "--height=100%",
-        "--border",
-        "--no-info",
-    ];
-    let result = process::pipe("fzf", args, &choices)?;
+    let labels = choices
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect::<Vec<_>>();
+    let result = interaction
+        .choose("Machine", &labels)?
+        .map(|index| choices[index].1.clone());
     if let Some(choice) = &result {
         config.debug(&format!(
-            "new-workspace machine-fzf selected={}",
+            "new-workspace machine-selection selected={}",
             crate::config::shell_debug(choice)
         ))?;
     } else {
-        config.debug("new-workspace machine-fzf cancelled")?;
+        config.debug("new-workspace machine-selection cancelled")?;
     }
     Ok(result)
 }
@@ -215,6 +224,7 @@ enum DirectoryChoice {
 
 fn choose_directory(
     config: &Config,
+    interaction: &dyn Interaction,
     destination: &str,
     home: &str,
     shell: &str,
@@ -232,41 +242,37 @@ fn choose_directory(
                 }
             }
         };
-        let prompt = format!("{} > ", display_path(home, &current, shell));
-        let mut choices = String::from("select\t< Select this folder>\nback\t< Back>\n");
+        let prompt = display_path(home, &current, shell);
+        let mut choices = vec![
+            ("< Select this folder".to_owned(), "select".to_owned()),
+            ("< Enter a path".to_owned(), "custom".to_owned()),
+            ("< Back".to_owned(), "back".to_owned()),
+        ];
         if current != "/" && !(is_windows_shell(shell) && is_windows_root(&current)) {
-            choices.push_str("up\t< Up>\n");
+            choices.push(("< Up".to_owned(), "up".to_owned()));
         }
         for name in directories {
-            choices.push_str("directory\t");
-            choices.push_str(&name);
-            choices.push('\n');
+            choices.push((format!("{name}/"), format!("directory\t{name}")));
         }
         config.debug(&format!(
-            "new-workspace directory-fzf started destination={destination} current={} rows={}",
+            "new-workspace directory-selection started destination={destination} current={} rows={}",
             crate::config::shell_debug(&current),
-            crate::config::shell_debug(&choices)
+            choices.len()
         ))?;
-        let args = vec![
-            "--delimiter=\t".to_owned(),
-            "--with-nth=2..".to_owned(),
-            format!("--prompt={prompt}"),
-            "--height=100%".into(),
-            "--border".into(),
-            "--no-info".into(),
-            "--print-query".into(),
-            "--bind=enter:accept-or-print-query".into(),
-        ];
-        let Some(result) = process::pipe("fzf", &args, &choices)? else {
+        let labels = choices
+            .iter()
+            .map(|(label, _)| label.clone())
+            .collect::<Vec<_>>();
+        let Some(index) = interaction.choose(&prompt, &labels)? else {
             return Ok(DirectoryChoice::Cancelled);
         };
-        let (query, choice) = result.split_once('\n').unwrap_or((&result, ""));
-        config.debug(&format!("new-workspace directory-fzf selected destination={destination} current={} query={} choice={}", crate::config::shell_debug(&current), crate::config::shell_debug(query), crate::config::shell_debug(choice)))?;
-        if !choice.contains('\t') {
-            if query.is_empty() {
+        let choice = &choices[index].1;
+        config.debug(&format!("new-workspace directory-selection selected destination={destination} current={} choice={}", crate::config::shell_debug(&current), crate::config::shell_debug(choice)))?;
+        if choice == "custom" {
+            let Some(query) = interaction.input("Path", Some(&current))? else {
                 continue;
-            }
-            let candidate = resolve_custom_path(home, query, shell);
+            };
+            let candidate = resolve_custom_path(home, &query, shell);
             let path = if destination == "local" {
                 fs::create_dir_all(&candidate)?;
                 workspace::canonical_local_path(&candidate)?
@@ -275,7 +281,7 @@ fn choose_directory(
             };
             return Ok(DirectoryChoice::Selected(path));
         }
-        let (kind, name) = choice.split_once('\t').unwrap();
+        let (kind, name) = choice.split_once('\t').unwrap_or((choice, ""));
         match kind {
             "select" => return Ok(DirectoryChoice::Selected(current)),
             "back" => return Ok(DirectoryChoice::Back),

@@ -219,25 +219,24 @@ pub fn read(config: &Config) -> Result<Snapshot> {
 
 pub fn lock<T>(config: &Config, path: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     config.secure_dir(&config.state_root)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
     let mut acquired = false;
     for _ in 0..500 {
-        match fs::create_dir(path) {
+        match file.try_lock() {
             Ok(()) => {
-                fs::write(path.join("owner"), std::process::id().to_string())?;
                 acquired = true;
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let owner = fs::read_to_string(path.join("owner"))
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<i32>().ok());
-                if owner.is_some_and(|pid| !process_alive(pid)) {
-                    let _ = fs::remove_dir_all(path);
-                    continue;
-                }
+            Err(std::fs::TryLockError::WouldBlock) => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Err(error) => return Err(error.into()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
     if !acquired {
@@ -248,24 +247,12 @@ pub fn lock<T>(config: &Config, path: &Path, operation: impl FnOnce() -> Result<
         }));
     }
     let result = operation();
-    let cleanup = fs::remove_dir_all(path).or_else(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Ok(())
-        } else {
-            Err(error)
-        }
-    });
-    match (result, cleanup) {
+    let unlock = file.unlock();
+    match (result, unlock) {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error.into()),
         (Ok(value), Ok(())) => Ok(value),
     }
-}
-
-fn process_alive(pid: i32) -> bool {
-    // Signal 0 checks for a process without sending it a signal.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 pub fn write(config: &Config, exclude_session: &str, exclude_window: &str) -> Result<()> {
