@@ -655,8 +655,9 @@ pass 'scripted FZF choices are exhausted exactly'
 "$TMUX" detach-client -t "$WIZARD_CLIENT"
 wait "$WIZARD_CLIENT_PID" 2>/dev/null || true
 
+WINDOWS_BEFORE_NATIVE=$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)
 "$TMUX" new-window -d -t '=remote:' 'sleep 120'
-assert_equal "$((WINDOWS_AFTER + 1))" "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
+assert_equal "$((WINDOWS_BEFORE_NATIVE + 1))" "$("$TMUX" list-windows -t '=remote' -F '#{window_id}' | wc -l)" 'native tmux command remains usable'
 "$TMUX" display-message -p -t '=remote:' '#{session_name}' >/dev/null || fail 'existing session remains inspectable without invoking scripts'
 pass 'existing session remains inspectable without invoking scripts'
 
