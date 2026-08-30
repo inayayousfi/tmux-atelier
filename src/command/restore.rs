@@ -9,17 +9,22 @@ use crate::{err, process, snapshot, workspace, Result};
 use workspace::Workspace;
 
 pub(super) fn adopt(app: &App, session: &str, client: Option<&str>) -> Result<()> {
-    snapshot::lock(app, &app.adoption_lock, || {
+    let changed = snapshot::lock(app, &app.adoption_lock, || {
         adopt_inner(app, session, client)
-    })
+    })?;
+    if changed {
+        app.snapshot("", "")?;
+        app.refresh_status_if_running()?;
+    }
+    Ok(())
 }
 
-fn adopt_inner(app: &App, session: &str, client: Option<&str>) -> Result<()> {
+fn adopt_inner(app: &App, session: &str, client: Option<&str>) -> Result<bool> {
     if session.is_empty()
         || !workspace::session_exists(app, session)
         || workspace::session_option(app, session, "@atelier_managed") == "1"
     {
-        return Ok(());
+        return Ok(false);
     }
     if process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_restore_pending"]).as_deref()
         == Some("1")
@@ -27,7 +32,7 @@ fn adopt_inner(app: &App, session: &str, client: Option<&str>) -> Result<()> {
         app.debug(&format!(
             "session adoption deferred session={session} restore=pending"
         ))?;
-        return Ok(());
+        return Ok(false);
     }
     let raw_path = process::tmux_output(
         app,
@@ -45,7 +50,7 @@ fn adopt_inner(app: &App, session: &str, client: Option<&str>) -> Result<()> {
             app.debug(&format!(
                 "session adoption skipped session={session} reason=invalid-cwd"
             ))?;
-            return Ok(());
+            return Ok(false);
         }
     };
     let inferred_client = if client.unwrap_or_default().is_empty() {
@@ -65,8 +70,7 @@ fn adopt_inner(app: &App, session: &str, client: Option<&str>) -> Result<()> {
             )?;
         }
         process::tmux(app, &["kill-session", "-t", &format!("={session}")])?;
-        app.snapshot("", "")?;
-        return app.refresh_status_if_running();
+        return Ok(true);
     }
     let name = existing
         .clone()
@@ -110,8 +114,7 @@ fn adopt_inner(app: &App, session: &str, client: Option<&str>) -> Result<()> {
         "session adopted old={old} workspace={name} path={}",
         crate::config::shell_debug(&path)
     ))?;
-    app.snapshot("", "")?;
-    app.refresh_status_if_running()
+    Ok(true)
 }
 
 fn client_for_session(app: &App, wanted: &str) -> Option<String> {
