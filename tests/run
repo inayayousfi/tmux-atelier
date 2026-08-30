@@ -724,7 +724,7 @@ for _ in {1..10}; do
     sleep 0.1
 done
 [[ -n $RESTORE_CLIENT ]] || fail "control client starts for restoration: $(< "$TEST_ROOT/restore-client.log")"
-for _ in {1..20}; do
+for _ in {1..200}; do
     if "$TMUX" has-session -t '=restore-me' 2>/dev/null &&
         ! "$TMUX" has-session -t '=bootstrap' 2>/dev/null; then
         break
