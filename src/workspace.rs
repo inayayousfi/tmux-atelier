@@ -424,6 +424,7 @@ mod tests {
             workspaces: root.join("workspaces"),
             debug_log: root.join("debug.log"),
             restore_file: root.join("restore.snapshot"),
+            ssh_destinations_file: root.join("ssh-destinations"),
             snapshot_lock: root.join(".snapshot.lock"),
             adoption_lock: root.join(".adoption.lock"),
         }

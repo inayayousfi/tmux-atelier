@@ -7,7 +7,7 @@ printf '%s\0' "$@" >> "$TMUX_ATELIER_SSH_LOG"
 windows=0
 powershell=0
 for argument in "$@"; do
-    [[ $argument == winhost ]] && windows=1
+    [[ $argument == winhost || $argument == *@winhost ]] && windows=1
     [[ $argument == pshost ]] && powershell=1
 done
 
@@ -40,8 +40,10 @@ if ((windows || powershell)); then
     elif [[ $command == *'Get-ChildItem'* ]]; then
         if [[ $command == *"'C:\\Users\\remote\\work dir'"* ]]; then
             printf '.hidden\r\n'
+        elif [[ $command == *'[Console]::OutputEncoding'* ]]; then
+            printf '.config\r\nModèles\r\nwork dir\r\n'
         else
-            printf '.config\r\nwork dir\r\n'
+            printf '.config\r\nMod\202les\r\nwork dir\r\n'
         fi
     elif [[ $command == *'Resolve-Path'* ]]; then
         printf 'C:\\Users\\remote\\new project\r\n'

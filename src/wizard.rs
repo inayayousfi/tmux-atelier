@@ -1,6 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use glob::glob;
@@ -43,14 +45,17 @@ pub fn choose_target(config: &Config, interaction: &dyn Interaction) -> Result<O
                 workspace::validate_destination(&input)?;
                 destination = input;
                 match remote_connection(config, &destination) {
-                    Ok(connection) => connection,
+                    Ok(connection) => {
+                        remember_destination(config, &destination)?;
+                        connection
+                    }
                     Err(_) => {
                         eprintln!("Could not connect to {destination}.");
                         continue;
                     }
                 }
             }
-            "alias" => match remote_connection(config, &destination) {
+            "destination" | "alias" => match remote_connection(config, &destination) {
                 Ok(connection) => connection,
                 Err(_) => {
                     eprintln!("Could not connect to {destination}.");
@@ -81,15 +86,12 @@ fn choose_machine(config: &Config, interaction: &dyn Interaction) -> Result<Opti
             "custom\tCustom SSH destination\t".to_owned(),
         ),
     ];
-    let home = env::var_os("HOME").ok_or("HOME is not configured")?;
+    let home = PathBuf::from(env::var_os("HOME").ok_or("HOME is not configured")?);
     let mut aliases = Vec::new();
-    aliases_from(
-        &PathBuf::from(home).join(".ssh/config"),
-        &mut HashSet::new(),
-        &mut aliases,
-    )?;
+    aliases_from(&home.join(".ssh/config"), &mut HashSet::new(), &mut aliases)?;
     aliases.sort();
     aliases.dedup();
+    let mut listed = HashSet::new();
     for alias in aliases {
         if let Some(choice) = alias_choice(config, &alias)? {
             let label = choice
@@ -97,7 +99,20 @@ fn choose_machine(config: &Config, interaction: &dyn Interaction) -> Result<Opti
                 .and_then(|(_, rest)| rest.rsplit_once('\t').map(|(label, _)| label))
                 .unwrap_or(&alias)
                 .to_owned();
+            listed.insert(alias);
             choices.push((label, choice));
+        }
+    }
+    let history = history_destinations(&home);
+    for destination in &history {
+        remember_destination(config, destination)?;
+    }
+    for destination in saved_destinations(config)?.into_iter().chain(history) {
+        if listed.insert(destination.clone()) {
+            choices.push((
+                destination.clone(),
+                format!("destination\t{destination}\t{destination}"),
+            ));
         }
     }
     config.debug(&format!(
@@ -120,6 +135,146 @@ fn choose_machine(config: &Config, interaction: &dyn Interaction) -> Result<Opti
         config.debug("new-workspace machine-selection cancelled")?;
     }
     Ok(result)
+}
+
+fn saved_destinations(config: &Config) -> Result<BTreeSet<String>> {
+    let contents = match fs::read_to_string(&config.ssh_destinations_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(contents
+        .lines()
+        .filter(|destination| {
+            *destination != "local" && workspace::validate_destination(destination).is_ok()
+        })
+        .map(str::to_owned)
+        .collect())
+}
+
+fn remember_destination(config: &Config, destination: &str) -> Result<()> {
+    config.secure_dir(&config.state_root)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .mode(0o600)
+        .open(&config.ssh_destinations_file)?;
+    file.lock()?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    if !contents.lines().any(|saved| saved == destination) {
+        writeln!(file, "{destination}")?;
+        file.sync_all()?;
+    }
+    file.unlock()?;
+    Ok(())
+}
+
+fn history_destinations(home: &Path) -> BTreeSet<String> {
+    let mut files = vec![
+        home.join(".bash_history"),
+        home.join(".zsh_history"),
+        home.join(".sh_history"),
+        home.join(".history"),
+        home.join(".local/share/fish/fish_history"),
+        home.join(".config/nushell/history.txt"),
+    ];
+    if let Some(history) = env::var_os("HISTFILE") {
+        let history = PathBuf::from(history);
+        files.push(if let Ok(rest) = history.strip_prefix("~") {
+            home.join(rest)
+        } else {
+            history
+        });
+    }
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME") {
+        files.push(PathBuf::from(data_home).join("fish/fish_history"));
+    }
+    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
+        files.push(PathBuf::from(config_home).join("nushell/history.txt"));
+    }
+    let mut destinations = BTreeSet::new();
+    files.sort();
+    files.dedup();
+    for file in files {
+        let Ok(contents) = fs::read(file) else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&contents).lines() {
+            destinations.extend(ssh_destinations_in(line));
+        }
+    }
+    destinations
+}
+
+fn ssh_destinations_in(line: &str) -> Vec<String> {
+    let line = line
+        .strip_prefix("- cmd: ")
+        .or_else(|| line.strip_prefix("  cmd: "))
+        .unwrap_or(line);
+    let line = if line.starts_with(": ") {
+        line.split_once(';')
+            .map(|(_, command)| command)
+            .unwrap_or(line)
+    } else {
+        line
+    };
+    let tokens: Vec<_> = line.split_whitespace().collect();
+    let mut found = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if clean_command_token(token) != "ssh" {
+            continue;
+        }
+        let mut skip_value = false;
+        for token in &tokens[index + 1..] {
+            let token = clean_token(token);
+            if token.is_empty() {
+                continue;
+            }
+            if skip_value {
+                skip_value = false;
+                continue;
+            }
+            if token == "--" {
+                continue;
+            }
+            if token.starts_with('-') {
+                skip_value = token.len() == 2
+                    && token
+                        .as_bytes()
+                        .get(1)
+                        .is_some_and(|option| b"BbcDEeFIiJLlmOopQRSWw".contains(option));
+                continue;
+            }
+            let Some((user, host)) = token.split_once('@') else {
+                break;
+            };
+            if !user.is_empty()
+                && !host.is_empty()
+                && !host.contains('@')
+                && workspace::validate_destination(token).is_ok()
+            {
+                found.push(token.to_owned());
+            }
+            break;
+        }
+    }
+    found
+}
+
+fn clean_command_token(token: &str) -> &str {
+    token.trim_matches(|character| matches!(character, ';' | '|' | '&' | '(' | ')' | '<' | '>'))
+}
+
+fn clean_token(token: &str) -> &str {
+    token.trim_matches(|character| {
+        matches!(
+            character,
+            '\'' | '"' | '`' | ';' | '|' | '&' | '(' | ')' | '<' | '>'
+        )
+    })
 }
 
 fn aliases_from(file: &Path, seen: &mut HashSet<PathBuf>, aliases: &mut Vec<String>) -> Result<()> {
@@ -320,7 +475,7 @@ fn remote_directories(
     shell: &str,
 ) -> Result<Vec<String>> {
     let remote = if is_windows_shell(shell) {
-        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"Get-ChildItem -LiteralPath {} -Force -Directory | ForEach-Object {{ [Console]::Out.WriteLine($_.Name) }}\"", quote_powershell(path))
+        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); Get-ChildItem -LiteralPath {} -Force -Directory | ForEach-Object {{ [Console]::Out.WriteLine($_.Name) }}\"", quote_powershell(path))
     } else {
         let inner = "cd -- \"$1\" 2>/dev/null || exit 1\nfor entry in ./* ./.[!.]* ./..?*; do\n    [ -d \"$entry\" ] || continue\n    name=${entry#./}\n    case $name in *\"\n\"*) continue ;; esac\n    printf \"%s\\n\" \"$name\"\ndone";
         format!("sh -c {} sh {}", quote_sh(inner), quote_sh(path))
@@ -344,7 +499,7 @@ fn create_remote_path(
     shell: &str,
 ) -> Result<String> {
     let remote = if is_windows_shell(shell) {
-        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"New-Item -ItemType Directory -Force -LiteralPath {} | Out-Null; [Console]::Out.WriteLine((Resolve-Path -LiteralPath {}).Path)\"", quote_powershell(path), quote_powershell(path))
+        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); New-Item -ItemType Directory -Force -LiteralPath {} | Out-Null; [Console]::Out.WriteLine((Resolve-Path -LiteralPath {}).Path)\"", quote_powershell(path), quote_powershell(path))
     } else {
         let inner = r#"mkdir -p -- "$1" && cd -- "$1" && pwd -P"#;
         format!("sh -c {} sh {}", quote_sh(inner), quote_sh(path))
@@ -455,5 +610,19 @@ mod tests {
             resolve_custom_path(r"C:\Users\me", r"D:\work", "windows"),
             r"D:\work"
         );
+    }
+
+    #[test]
+    fn ssh_destinations_are_extracted_from_shell_history() {
+        assert_eq!(
+            ssh_destinations_in(": 1710000000:0;ssh -p 2222 'deploy@app.example'"),
+            ["deploy@app.example"]
+        );
+        assert_eq!(
+            ssh_destinations_in("- cmd: sudo ssh -J jump@gateway root@10.0.0.4"),
+            ["root@10.0.0.4"]
+        );
+        assert!(ssh_destinations_in("ssh app printf user@example.com").is_empty());
+        assert!(ssh_destinations_in("printf 'ssh user@example.com'").is_empty());
     }
 }

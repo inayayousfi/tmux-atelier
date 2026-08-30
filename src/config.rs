@@ -14,6 +14,7 @@ pub struct Config {
     pub workspaces: PathBuf,
     pub debug_log: PathBuf,
     pub restore_file: PathBuf,
+    pub ssh_destinations_file: PathBuf,
     pub snapshot_lock: PathBuf,
     pub adoption_lock: PathBuf,
 }
@@ -37,6 +38,7 @@ impl Config {
             workspaces: state_root.join("workspaces"),
             debug_log,
             restore_file: state_root.join("restore.snapshot"),
+            ssh_destinations_file: state_root.join("ssh-destinations"),
             snapshot_lock: state_root.join(".snapshot.lock"),
             adoption_lock: state_root.join(".adoption.lock"),
             state_root,

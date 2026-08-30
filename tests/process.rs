@@ -342,6 +342,80 @@ fn scripted_wizard_edits_and_renames_workspace() {
 }
 
 #[test]
+fn wizard_recovers_and_remembers_ssh_destinations() {
+    let env = TestEnv::new();
+    let local = env.root.path().join("local");
+    fs::create_dir(&local).unwrap();
+    fs::write(
+        env.root.path().join(".bash_history"),
+        "ssh -p 2200 history@winhost\n",
+    )
+    .unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", local.display()),
+        "before",
+        "--detached",
+    ]);
+
+    let history = env
+        .scripted("choose\thistory@winhost\nchoose\t< Select this folder\ninput\tfrom-history\n");
+    let history_log = env.root.path().join("history.log");
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_INTERACTION_FILE", history)
+        .env("TMUX_ATELIER_INTERACTION_LOG", &history_log)
+        .args(["internal", "popup-edit", "before"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(fs::read_to_string(env.workspace("from-history"))
+        .unwrap()
+        .contains("destination=history@winhost"));
+    assert!(fs::read_to_string(history_log)
+        .unwrap()
+        .contains("Modèles/"));
+
+    let custom = env.scripted(
+        "choose\tCustom SSH destination\ninput\tremembered@app.example\nchoose\t< Select this folder\ninput\tremembered\n",
+    );
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_INTERACTION_FILE", custom)
+        .args(["internal", "popup-edit", "from-history"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let destinations = env.state.join("ssh-destinations");
+    assert_eq!(
+        fs::read_to_string(&destinations).unwrap(),
+        "history@winhost\nremembered@app.example\n"
+    );
+    assert_eq!(
+        fs::metadata(&destinations).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let cancel = env.scripted("cancel\n");
+    let log = env.root.path().join("remembered.log");
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_INTERACTION_FILE", cancel)
+        .env("TMUX_ATELIER_INTERACTION_LOG", &log)
+        .args(["internal", "popup-edit", "remembered"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let choices = fs::read_to_string(log).unwrap();
+    assert!(choices.contains("history@winhost"));
+    assert!(choices.contains("remembered@app.example"));
+}
+
+#[test]
 fn scripted_confirmation_controls_destructive_actions() {
     let env = TestEnv::new();
     let path = env.root.path().join("project");
