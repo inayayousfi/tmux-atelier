@@ -14,6 +14,7 @@ WORKSPACE_NAME=
 WORKSPACE_DESTINATION=
 WORKSPACE_PATH=
 WORKSPACE_CREATED=
+WORKSPACE_SHELL=
 SNAPSHOT_TOKEN=
 RESTORE_ACTIVE=
 declare -A SSH_CONFIG_SEEN=()
@@ -54,6 +55,10 @@ validate_destination() {
         die "invalid OpenSSH destination: $1"
 }
 
+is_windows_shell() {
+    [[ $1 == windows || $1 == powershell ]]
+}
+
 workspace_file() {
     validate_name "$1"
     printf '%s/%s\n' "$WORKSPACES_DIR" "$1"
@@ -61,7 +66,7 @@ workspace_file() {
 
 read_workspace() {
     local name=$1 file key value
-    local seen_name=0 seen_destination=0 seen_path=0 seen_created=0
+    local seen_name=0 seen_destination=0 seen_path=0 seen_created=0 seen_shell=0
 
     file=$(workspace_file "$name")
     [[ -f $file ]] || die "workspace not found: $name"
@@ -70,6 +75,7 @@ read_workspace() {
     WORKSPACE_DESTINATION=
     WORKSPACE_PATH=
     WORKSPACE_CREATED=
+    WORKSPACE_SHELL=
     while IFS='=' read -r key value || [[ -n $key ]]; do
         case $key in
             name)
@@ -92,6 +98,11 @@ read_workspace() {
                 WORKSPACE_CREATED=$value
                 seen_created=1
                 ;;
+            shell)
+                ((seen_shell == 0)) || die "duplicate shell in workspace: $name"
+                WORKSPACE_SHELL=$value
+                seen_shell=1
+                ;;
             ''|'#'*) ;;
         esac
     done < "$file"
@@ -101,6 +112,21 @@ read_workspace() {
     validate_name "$WORKSPACE_NAME"
     validate_destination "$WORKSPACE_DESTINATION"
     validate_value path "$WORKSPACE_PATH"
+    if ((seen_shell)); then
+        [[ $WORKSPACE_SHELL == local || $WORKSPACE_SHELL == posix ||
+            $WORKSPACE_SHELL == windows || $WORKSPACE_SHELL == powershell ]] ||
+            die "invalid shell in workspace: $name"
+    elif [[ $WORKSPACE_DESTINATION == local ]]; then
+        WORKSPACE_SHELL=local
+    else
+        WORKSPACE_SHELL=posix
+    fi
+    if [[ $WORKSPACE_DESTINATION == local ]]; then
+        [[ $WORKSPACE_SHELL == local ]] || die "invalid shell for local workspace: $name"
+    else
+        [[ $WORKSPACE_SHELL == posix ]] || is_windows_shell "$WORKSPACE_SHELL" ||
+            die "invalid shell for remote workspace: $name"
+    fi
     if ((seen_created)); then
         [[ $WORKSPACE_CREATED =~ ^[0-9]+([.][0-9]+)?$ ]] ||
             die "invalid creation time in workspace: $name"
@@ -110,20 +136,27 @@ read_workspace() {
 }
 
 write_workspace() {
-    local name=$1 destination=$2 path=$3 mode=${4:-replace} created=${5:-} file temporary
+    local name=$1 destination=$2 path=$3 mode=${4:-replace} created=${5:-} shell=${6:-} file temporary
     validate_name "$name"
     validate_destination "$destination"
     validate_value path "$path"
     [[ -n $created ]] || created=$(date +%s.%N)
     [[ $created =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid creation time: $created"
+    [[ -n $shell ]] || { [[ $destination == local ]] && shell=local || shell=posix; }
+    [[ $shell == local || $shell == posix ]] || is_windows_shell "$shell" || die "invalid shell: $shell"
+    if [[ $destination == local ]]; then
+        [[ $shell == local ]] || die "invalid shell for local workspace: $shell"
+    else
+        [[ $shell == posix ]] || is_windows_shell "$shell" || die "invalid shell for remote workspace: $shell"
+    fi
 
     mkdir -p "$WORKSPACES_DIR" || return 1
     chmod 700 "$WORKSPACES_DIR" || return 1
     file=$(workspace_file "$name")
     temporary=$(mktemp "$WORKSPACES_DIR/.${name}.XXXXXX") || return 1
     chmod 600 "$temporary" || { rm -f "$temporary"; return 1; }
-    if ! printf 'name=%s\ndestination=%s\npath=%s\ncreated=%s\n' \
-        "$name" "$destination" "$path" "$created" > "$temporary"; then
+    if ! printf 'name=%s\ndestination=%s\npath=%s\ncreated=%s\nshell=%s\n' \
+        "$name" "$destination" "$path" "$created" "$shell" > "$temporary"; then
         rm -f "$temporary"
         return 1
     fi
@@ -148,17 +181,18 @@ parse_target() {
 }
 
 normalise_name() {
-    local path=$1 excluded_session=${2:-} candidate base suffix=2
+    local path=$1 excluded_session=${2:-} excluded_definition=${3:-} candidate base suffix=2
     base=${path%/}
     base=${base##*/}
+    base=${base##*\\}
     [[ -n $base && $base != '.' && $base != '~' ]] || base=workspace
     candidate=${base//[^A-Za-z0-9_-]/-}
     candidate=${candidate#-}
     candidate=${candidate%-}
     [[ -n $candidate ]] || candidate=workspace
     base=$candidate
-    while [[ -e $WORKSPACES_DIR/$candidate ]] ||
-        { [[ $candidate != "$excluded_session" ]] && session_exists "$candidate"; }; do
+    while { [[ $candidate != "$excluded_definition" && -e $WORKSPACES_DIR/$candidate ]] ||
+        { [[ $candidate != "$excluded_session" ]] && session_exists "$candidate"; }; }; do
         candidate="$base-$suffix"
         ((suffix++))
     done
@@ -175,6 +209,11 @@ session_option() {
 
 quote_sh() {
     local value=${1//\'/\'\\\'\'}
+    printf "'%s'" "$value"
+}
+
+quote_powershell() {
+    local value=${1//\'/\'\'}
     printf "'%s'" "$value"
 }
 
@@ -199,11 +238,17 @@ ssh_cmd() {
 }
 
 remote_shell_command() {
-    local destination=$1 path=$2 remote command inner argument
-    # $1 and $SHELL are intentionally expanded by the remote POSIX shell.
-    # shellcheck disable=SC2016
-    inner='cd -- "$1" && exec "${SHELL:-/bin/sh}" -l'
-    remote="sh -c $(quote_sh "$inner") sh $(quote_sh "$path")"
+    local destination=$1 path=$2 shell=${3:-posix} remote command inner argument
+    if [[ $shell == powershell ]]; then
+        remote="powershell.exe -NoLogo -NoExit -Command \"Set-Location -LiteralPath $(quote_powershell "$path")\""
+    elif [[ $shell == windows ]]; then
+        remote="powershell.exe -NoLogo -NoProfile -Command \"Set-Location -LiteralPath $(quote_powershell "$path"); & \$env:ComSpec\""
+    else
+        # $1 and $SHELL are intentionally expanded by the remote POSIX shell.
+        # shellcheck disable=SC2016
+        inner='cd -- "$1" && exec "${SHELL:-/bin/sh}" -l'
+        remote="sh -c $(quote_sh "$inner") sh $(quote_sh "$path")"
+    fi
     prepare_ssh_args
     command='exec ssh'
     for argument in "${SSH_COMMON_ARGS[@]}"; do
@@ -214,23 +259,24 @@ remote_shell_command() {
 }
 
 mark_session() {
-    local name=$1 destination=$2 path=$3
+    local name=$1 destination=$2 path=$3 shell=${4:-posix}
     tmux_cmd set-option -q -t "=$name:" @atelier_managed 1
     tmux_cmd set-option -q -t "=$name:" @atelier_destination "$destination"
     tmux_cmd set-option -q -t "=$name:" @atelier_path "$path"
+    tmux_cmd set-option -q -t "=$name:" @atelier_shell "$shell"
 }
 
 create_session() {
-    local name=$1 destination=$2 path=$3 initial_path=${4:-$3} command
+    local name=$1 destination=$2 path=$3 initial_path=${4:-$3} shell=${5:-posix} command
     if [[ $destination == local ]]; then
         [[ -d $path ]] || die "local path is not a directory: $path"
         [[ -d $initial_path ]] || initial_path=$path
         tmux_cmd new-session -d -s "$name" -c "$initial_path" || return 1
     else
-        command=$(remote_shell_command "$destination" "$path")
+        command=$(remote_shell_command "$destination" "$path" "$shell")
         tmux_cmd new-session -d -s "$name" "$command" || return 1
     fi
-    if ! mark_session "$name" "$destination" "$path"; then
+    if ! mark_session "$name" "$destination" "$path" "$shell"; then
         tmux_cmd kill-session -t "=$name" 2>/dev/null || true
         return 1
     fi
@@ -295,7 +341,7 @@ adopt_session() {
         fi
         session=$name
     fi
-    if ! mark_session "$session" local "$path"; then
+    if ! mark_session "$session" local "$path" local; then
         [[ $session == "$old" ]] || tmux_cmd rename-session -t "=$session" "$old" 2>/dev/null || true
         [[ -n $existing ]] || rm -f "$(workspace_file "$name")"
         return 1
@@ -505,30 +551,30 @@ validate_snapshot() (
 )
 
 create_restore_window() {
-    local session=$1 destination=$2 root=$3 initial_path=$4 command
+    local session=$1 destination=$2 root=$3 initial_path=$4 shell=${5:-posix} command
     if [[ $destination == local ]]; then
         [[ -d $initial_path ]] || initial_path=$root
         tmux_cmd new-window -a -d -P -F '#{window_id}' -t "=$session:{end}" -c "$initial_path"
     else
-        command=$(remote_shell_command "$destination" "$root")
+        command=$(remote_shell_command "$destination" "$root" "$shell")
         tmux_cmd new-window -a -d -P -F '#{window_id}' -t "=$session:{end}" "$command"
     fi
 }
 
 create_restore_pane() {
-    local window=$1 destination=$2 root=$3 path=$4 command
+    local window=$1 destination=$2 root=$3 path=$4 shell=${5:-posix} command
     if [[ $destination == local ]]; then
         [[ -d $path ]] || path=$root
         tmux_cmd split-window -d -t "$window" -c "$path"
     else
-        command=$(remote_shell_command "$destination" "$root")
+        command=$(remote_shell_command "$destination" "$root" "$shell")
         tmux_cmd split-window -d -t "$window" "$command"
     fi
 }
 
 restore_snapshot_data() {
     local created_file=$1 active name active_window window_index window_name automatic_rename layout pane_count active_pane
-    local destination root window restored_active_window path i skip first_window
+    local destination root shell window restored_active_window path i skip first_window
     local -a paths panes
     exec 3< "$RESTORE_FILE"
     snapshot_expect tmux-atelier-restore
@@ -549,6 +595,7 @@ restore_snapshot_data() {
             read_workspace "$name"
             destination=$WORKSPACE_DESTINATION
             root=$WORKSPACE_PATH
+            shell=$WORKSPACE_SHELL
         fi
 
         while snapshot_read && [[ $SNAPSHOT_TOKEN != end-workspace ]]; do
@@ -568,14 +615,14 @@ restore_snapshot_data() {
 
             if ((first_window)); then
                 printf '%s\n' "$name" >> "$created_file"
-                create_session "$name" "$destination" "$root" "${paths[0]}"
+                create_session "$name" "$destination" "$root" "${paths[0]}" "$shell"
                 window=$(tmux_cmd display-message -p -t "=$name:" '#{window_id}')
                 first_window=0
             else
-                window=$(create_restore_window "$name" "$destination" "$root" "${paths[0]}")
+                window=$(create_restore_window "$name" "$destination" "$root" "${paths[0]}" "$shell")
             fi
             for ((i = 1; i < 10#$pane_count; ++i)); do
-                create_restore_pane "$window" "$destination" "$root" "${paths[$i]}"
+                create_restore_pane "$window" "$destination" "$root" "${paths[$i]}" "$shell"
             done
             tmux_cmd select-layout -t "$window" "$layout" >/dev/null
             tmux_cmd rename-window -t "$window" "$window_name"
@@ -807,12 +854,13 @@ select_session() {
 }
 
 command_new() {
-    local target=${1:-} name=${2:-} detached=${3:-}
+    local target=${1:-} name=${2:-} detached=${3:-} shell=${4:-}
     [[ -n $target ]] || die 'usage: tmux-atelier new destination:path [name] [--detached]'
     [[ $name != --detached ]] || { detached=$name; name=; }
     [[ -z $detached || $detached == --detached ]] || die "unknown argument: $detached"
 
     parse_target "$target"
+    [[ -n $shell ]] || { [[ $WORKSPACE_DESTINATION == local ]] && shell=local || shell=posix; }
     [[ -n $name ]] || name=$(normalise_name "$WORKSPACE_PATH")
     validate_name "$name"
     [[ ! -e $(workspace_file "$name") ]] || die "workspace already exists: $name"
@@ -820,9 +868,9 @@ command_new() {
     [[ $WORKSPACE_DESTINATION != local || -d $WORKSPACE_PATH ]] ||
         die "local path is not a directory: $WORKSPACE_PATH"
 
-    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" create ||
+    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" create '' "$shell" ||
         die "workspace already exists: $name"
-    if ! create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH"; then
+    if ! create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" "$WORKSPACE_PATH" "$shell"; then
         die "definition saved, but the session could not be created: $name"
     fi
     command_snapshot
@@ -831,7 +879,7 @@ command_new() {
 }
 
 command_open() {
-    local name=${1:-} detached=${2:-} destination path
+    local name=${1:-} detached=${2:-} destination path shell
     [[ -n $name ]] || die 'usage: tmux-atelier open name [--detached]'
     validate_name "$name"
     [[ -z $detached || $detached == --detached ]] || die "unknown argument: $detached"
@@ -840,12 +888,15 @@ command_open() {
         read_workspace "$name"
         destination=$(session_option "$name" @atelier_destination)
         path=$(session_option "$name" @atelier_path)
+        shell=$(session_option "$name" @atelier_shell)
+        [[ -n $shell ]] || { [[ $destination == local ]] && shell=local || shell=posix; }
         [[ $(session_option "$name" @atelier_managed) == 1 &&
-            $destination == "$WORKSPACE_DESTINATION" && $path == "$WORKSPACE_PATH" ]] ||
+            $destination == "$WORKSPACE_DESTINATION" && $path == "$WORKSPACE_PATH" &&
+            $shell == "$WORKSPACE_SHELL" ]] ||
             die "saved workspace conflicts with tmux session: $name"
     elif ! session_exists "$name"; then
         read_workspace "$name"
-        create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH"
+        create_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" "$WORKSPACE_PATH" "$WORKSPACE_SHELL"
     fi
     command_snapshot
     refresh_status_if_running
@@ -857,7 +908,7 @@ current_session() {
 }
 
 command_window() {
-    local session=${1:-} destination path command
+    local session=${1:-} destination path shell command
     [[ -n $session ]] || session=$(current_session)
     if [[ $(session_option "$session" @atelier_managed) != 1 ]]; then
         tmux_cmd new-window -a -t "=$session:{end}"
@@ -865,17 +916,18 @@ command_window() {
     fi
     destination=$(session_option "$session" @atelier_destination)
     path=$(session_option "$session" @atelier_path)
+    shell=$(session_option "$session" @atelier_shell); shell=${shell:-posix}
     if [[ $destination == local ]]; then
         tmux_cmd new-window -a -t "=$session:{end}" -c "$path"
     else
-        command=$(remote_shell_command "$destination" "$path")
+        command=$(remote_shell_command "$destination" "$path" "$shell")
         tmux_cmd new-window -a -t "=$session:{end}" "$command"
     fi
     command_snapshot
 }
 
 command_split() {
-    local orientation=${1:-} pane=${2:-} session destination path command
+    local orientation=${1:-} pane=${2:-} session destination path shell command
     [[ $orientation == vertical || $orientation == horizontal ]] ||
         die 'usage: tmux-atelier split vertical|horizontal [pane]'
     [[ -n $pane ]] || pane=$(tmux_cmd display-message -p '#{pane_id}')
@@ -889,10 +941,11 @@ command_split() {
     fi
     destination=$(session_option "$session" @atelier_destination)
     path=$(session_option "$session" @atelier_path)
+    shell=$(session_option "$session" @atelier_shell); shell=${shell:-posix}
     if [[ $destination == local ]]; then
         tmux_cmd "${split_args[@]}" -c "$path"
     else
-        command=$(remote_shell_command "$destination" "$path")
+        command=$(remote_shell_command "$destination" "$path" "$shell")
         tmux_cmd "${split_args[@]}" "$command"
     fi
     command_snapshot
@@ -1091,10 +1144,10 @@ command_popup_workspace_menu() {
     file=$(workspace_file "$name")
     debug_log "workspace-fzf started name=$name inherited_client=$client"
     if ! action=$({
-        printf 'Open workspace\nRename workspace\n'
-        [[ -f $file ]] && ! session_exists "$name" && printf 'Edit target\n'
-        session_exists "$name" && printf 'Close workspace\n'
-        [[ -f $file ]] && printf 'Delete saved workspace\n'
+        ! session_exists "$name" && printf 'Open workspace\n'
+        printf 'Edit workspace\n'
+        session_exists "$name" && printf 'Stop workspace\n'
+        [[ -f $file ]] && printf 'Delete workspace\n'
         true
     } | choose_action "$name"); then
         debug_log "workspace-fzf cancelled name=$name inherited_client=$client"
@@ -1104,10 +1157,26 @@ command_popup_workspace_menu() {
 
     case $action in
         'Open workspace') command_open "$name" ;;
+        'Edit workspace') command_popup_workspace_edit_menu "$name" ;;
+        'Stop workspace') command_defer_request request-close "$name" "$client" ;;
+        'Delete workspace') command_defer_request request-delete "$name" "$client" ;;
+    esac
+}
+
+command_popup_workspace_edit_menu() {
+    local name=${1:-} file action client=${TMUX_ATELIER_CLIENT:-}
+    validate_name "$name"
+    file=$(workspace_file "$name")
+    if ! action=$({
+        [[ -f $file ]] && printf 'Change target\n'
+        printf 'Rename workspace\n'
+    } | choose_action "Edit $name"); then
+        return 0
+    fi
+
+    case $action in
+        'Change target') command_popup_edit "$name" ;;
         'Rename workspace') command_defer_request request-rename "$name" "$client" ;;
-        'Edit target') command_popup_edit "$name" ;;
-        'Close workspace') command_defer_request request-close "$name" "$client" ;;
-        'Delete saved workspace') command_defer_request request-delete "$name" "$client" ;;
     esac
 }
 
@@ -1248,6 +1317,7 @@ command_delete() {
     local name=${1:-} file
     file=$(workspace_file "$name")
     [[ -f $file ]] || die "workspace definition not found: $name"
+    session_exists "$name" && command_close "$name"
     rm -f "$file"
     command_snapshot
     refresh_status_if_running
@@ -1260,7 +1330,7 @@ command_request_close() {
     command="run-shell -b \"$qcli close $qname\""
     local -a confirm_args=(confirm-before)
     [[ -z $client ]] || confirm_args+=(-t "$client")
-    tmux_cmd "${confirm_args[@]}" -p "Close session $name? (y/n)" "$command"
+    tmux_cmd "${confirm_args[@]}" -p "Stop workspace $name? (y/n)" "$command"
 }
 
 command_request_rename() {
@@ -1282,12 +1352,12 @@ command_request_delete() {
     command="run-shell -b \"$qcli delete $qname\""
     local -a confirm_args=(confirm-before)
     [[ -z $client ]] || confirm_args+=(-t "$client")
-    tmux_cmd "${confirm_args[@]}" -p "Delete definition $name? (y/n)" "$command"
+    tmux_cmd "${confirm_args[@]}" -p "Delete workspace $name? (y/n)" "$command"
 }
 
 command_rename() {
     local old=${1:-} new=${2:-} old_file new_file session_renamed=0
-    local destination='' path='' created=''
+    local destination='' path='' created='' shell=''
     validate_name "$old"
     validate_name "$new"
     [[ $old != "$new" ]] || return 0
@@ -1302,6 +1372,7 @@ command_rename() {
         destination=$WORKSPACE_DESTINATION
         path=$WORKSPACE_PATH
         created=$WORKSPACE_CREATED
+        shell=$WORKSPACE_SHELL
     fi
 
     if session_exists "$old"; then
@@ -1309,7 +1380,7 @@ command_rename() {
         session_renamed=1
     fi
     if [[ -f $old_file ]]; then
-        if ! write_workspace "$new" "$destination" "$path" create "$created"; then
+        if ! write_workspace "$new" "$destination" "$path" create "$created" "$shell"; then
             ((session_renamed)) && tmux_cmd rename-session -t "=$new" "$old" || true
             die "could not rename workspace: $old"
         fi
@@ -1320,16 +1391,30 @@ command_rename() {
 }
 
 command_edit() {
-    local name=${1:-} target=${2:-}
+    local name=${1:-} target=${2:-} requested_shell=${3:-} old_destination old_shell shell
     validate_name "$name"
     [[ -n $target ]] || die 'usage: tmux-atelier edit name destination:path'
-    ! session_exists "$name" || die "close the session before editing its target: $name"
     read_workspace "$name"
+    old_destination=$WORKSPACE_DESTINATION
+    old_shell=$WORKSPACE_SHELL
     parse_target "$target"
     [[ $WORKSPACE_DESTINATION != local || -d $WORKSPACE_PATH ]] ||
         die "local path is not a directory: $WORKSPACE_PATH"
-    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" replace "$WORKSPACE_CREATED" ||
+    if [[ -n $requested_shell ]]; then
+        shell=$requested_shell
+    elif [[ $WORKSPACE_DESTINATION == local ]]; then
+        shell=local
+    elif [[ $WORKSPACE_DESTINATION == "$old_destination" ]]; then
+        shell=$old_shell
+    else
+        shell=posix
+    fi
+    write_workspace "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" replace "$WORKSPACE_CREATED" "$shell" ||
         die "could not update workspace: $name"
+    if session_exists "$name"; then
+        mark_session "$name" "$WORKSPACE_DESTINATION" "$WORKSPACE_PATH" "$shell" ||
+            die "workspace saved, but the running session could not be updated: $name"
+    fi
     refresh_status_if_running
 }
 
@@ -1414,7 +1499,13 @@ create_local_path() {
 }
 
 create_remote_path() {
-    local destination=$1 path=$2 inner remote
+    local destination=$1 path=$2 shell=${3:-posix} inner remote result
+    if is_windows_shell "$shell"; then
+        remote="powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"New-Item -ItemType Directory -Force -LiteralPath $(quote_powershell "$path") | Out-Null; [Console]::Out.WriteLine((Resolve-Path -LiteralPath $(quote_powershell "$path")).Path)\""
+        result=$(ssh_cmd "$destination" "$remote") || return 1
+        printf '%s\n' "${result%$'\r'}"
+        return
+    fi
     # $1 is expanded by the remote shell.
     # shellcheck disable=SC2016
     inner='mkdir -p -- "$1" && cd -- "$1" && pwd -P'
@@ -1422,11 +1513,25 @@ create_remote_path() {
     ssh_cmd "$destination" "$remote"
 }
 
-remote_home() {
-    local destination=$1
+remote_connection() {
+    local destination=$1 home remote
+    remote='[Console]::Out.WriteLine([Environment]::GetFolderPath('"'"'UserProfile'"'"'))'
+    if home=$(ssh_cmd "$destination" "$remote" 2>/dev/null) && [[ -n $home ]]; then
+        printf 'powershell\t%s\n' "${home%$'\r'}"
+        return 0
+    fi
+    remote='powershell.exe -NoLogo -NoProfile -NonInteractive -Command "[Console]::Out.WriteLine([Environment]::GetFolderPath('"'"'UserProfile'"'"'))"'
+    if home=$(ssh_cmd "$destination" "$remote" 2>/dev/null) && [[ -n $home ]]; then
+        printf 'windows\t%s\n' "${home%$'\r'}"
+        return 0
+    fi
     # $HOME is expanded by the remote shell.
     # shellcheck disable=SC2016
-    ssh_cmd "$destination" 'printf "%s\n" "$HOME"'
+    if home=$(ssh_cmd "$destination" 'printf "%s\n" "$HOME"') && [[ -n $home ]]; then
+        printf 'posix\t%s\n' "$home"
+        return 0
+    fi
+    return 1
 }
 
 local_directories() {
@@ -1446,7 +1551,15 @@ local_directories() {
 }
 
 remote_directories() {
-    local destination=$1 path=$2 inner remote
+    local destination=$1 path=$2 shell=${3:-posix} inner remote entry directories
+    if is_windows_shell "$shell"; then
+        remote="powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"Get-ChildItem -LiteralPath $(quote_powershell "$path") -Force -Directory | ForEach-Object { [Console]::Out.WriteLine(\$_.Name) }\""
+        directories=$(ssh_cmd "$destination" "$remote") || return 1
+        while IFS= read -r entry; do
+            printf '%s\n' "${entry%$'\r'}"
+        done <<< "$directories"
+        return
+    fi
     # Variables in this script are expanded by the remote shell.
     # shellcheck disable=SC2016
     inner='cd -- "$1" 2>/dev/null || exit 1
@@ -1462,7 +1575,16 @@ done'
 }
 
 resolve_custom_path() {
-    local home=$1 input=$2 tilde='~'
+    local home=$1 input=$2 shell=${3:-posix} tilde='~'
+    if is_windows_shell "$shell"; then
+        case $input in
+            "$tilde") printf '%s\n' "$home" ;;
+            "$tilde/"*|"$tilde\\"*) printf '%s\\%s\n' "${home%[\\/]}" "${input:2}" ;;
+            [A-Za-z]:[\\/]*|\\\\*) printf '%s\n' "$input" ;;
+            *) printf '%s\\%s\n' "${home%[\\/]}" "$input" ;;
+        esac
+        return
+    fi
     case $input in
         "$tilde") printf '%s\n' "$home" ;;
         "$tilde/"*) printf '%s/%s\n' "${home%/}" "${input#\~/}" ;;
@@ -1472,16 +1594,27 @@ resolve_custom_path() {
 }
 
 parent_path() {
-    local path=${1%/}
+    local path=$1 shell=${2:-posix}
+    if is_windows_shell "$shell"; then
+        path=${path%[\\/]}
+        [[ $path != [A-Za-z]: ]] || { printf '%s\\\n' "$path"; return; }
+        path=${path%[\\/]*}
+        [[ $path != [A-Za-z]: ]] || path+=$'\\'
+        printf '%s\n' "$path"
+        return
+    fi
+    path=${path%/}
     [[ $path != / ]] || { printf '/\n'; return; }
     path=${path%/*}
     printf '%s\n' "${path:-/}"
 }
 
 display_path() {
-    local home=$1 path=$2 tilde='~'
+    local home=$1 path=$2 shell=${3:-posix} tilde='~'
     if [[ $path == "$home" ]]; then
         printf '%s/\n' "$tilde"
+    elif is_windows_shell "$shell" && [[ $path == "$home"[\\/]* ]]; then
+        printf '%s\\%s\n' "$tilde" "${path#"$home"?}"
     elif [[ $path == "$home"/* ]]; then
         printf '%s/%s\n' "$tilde" "${path#"$home"/}"
     else
@@ -1490,20 +1623,20 @@ display_path() {
 }
 
 choose_directory() {
-    local destination=$1 home=$2 current=$2 result query choice choice_type candidate name prompt directories choices
+    local destination=$1 home=$2 shell=${3:-posix} current=$2 result query choice choice_type candidate name prompt directories choices
     while true; do
         if [[ $destination == local ]]; then
             directories=$(local_directories "$current") || return 1
         else
-            directories=$(remote_directories "$destination" "$current") || {
+            directories=$(remote_directories "$destination" "$current" "$shell") || {
                 printf 'Could not list remote directory: %s\n' "$current" >&2
                 return 1
             }
         fi
-        prompt="$(display_path "$home" "$current") > "
+        prompt="$(display_path "$home" "$current" "$shell") > "
         choices=$({
             printf 'select\t< Select this folder>\nback\t< Back>\n'
-            [[ $current == / ]] || printf 'up\t< Up>\n'
+            [[ $current == / ]] || { is_windows_shell "$shell" && [[ $current == [A-Za-z]:\\ ]]; } || printf 'up\t< Up>\n'
             if [[ -n $directories ]]; then
                 while IFS= read -r name; do
                     printf 'directory\t%s\n' "$name"
@@ -1528,11 +1661,11 @@ choose_directory() {
 
         if [[ $choice != *$'\t'* ]]; then
             [[ -n $query ]] || continue
-            candidate=$(resolve_custom_path "$home" "$query")
+            candidate=$(resolve_custom_path "$home" "$query" "$shell")
             if [[ $destination == local ]]; then
                 create_local_path "$candidate"
             else
-                create_remote_path "$destination" "$candidate"
+                create_remote_path "$destination" "$candidate" "$shell"
             fi
             return
         fi
@@ -1541,46 +1674,54 @@ choose_directory() {
         case $choice_type in
             select) printf '%s\n' "$current"; return 0 ;;
             back) return 2 ;;
-            up) current=$(parent_path "$current") ;;
+            up) current=$(parent_path "$current" "$shell") ;;
             directory)
                 name=${choice#*$'\t'}
-                [[ $current == / ]] && current="/$name" || current="$current/$name"
+                if is_windows_shell "$shell"; then
+                    current="${current%[\\/]}\\$name"
+                else
+                    [[ $current == / ]] && current="/$name" || current="$current/$name"
+                fi
                 ;;
         esac
     done
 }
 
-command_popup_new() {
-    local machine machine_type destination home path suggested name status target
-    local client=${TMUX_ATELIER_CLIENT:-}
+choose_workspace_target() {
+    local machine machine_type destination connection shell home path status
     while true; do
-        machine=$(choose_machine) || return 0
+        machine=$(choose_machine) || return 1
         machine_type=${machine%%$'\t'*}
         destination=${machine##*$'\t'}
         debug_log "new-workspace machine-type=$machine_type destination=$destination"
         case $machine_type in
             local)
                 destination=local
+                shell=local
                 home=$HOME
                 ;;
             custom)
                 read -r -e -p 'OpenSSH destination (user@host or alias): ' destination || continue
                 validate_destination "$destination"
-                home=$(remote_home "$destination") || {
+                connection=$(remote_connection "$destination") || {
                     printf 'Could not connect to %s.\n' "$destination" >&2
                     continue
                 }
+                shell=${connection%%$'\t'*}
+                home=${connection#*$'\t'}
                 ;;
             alias)
                 validate_destination "$destination"
-                home=$(remote_home "$destination") || {
+                connection=$(remote_connection "$destination") || {
                     printf 'Could not connect to %s.\n' "$destination" >&2
                     continue
                 }
+                shell=${connection%%$'\t'*}
+                home=${connection#*$'\t'}
                 ;;
             *) continue ;;
         esac
-        if path=$(choose_directory "$destination" "$home"); then
+        if path=$(choose_directory "$destination" "$home" "$shell"); then
             status=0
         else
             status=$?
@@ -1588,13 +1729,28 @@ command_popup_new() {
         ((status == 0)) || {
             debug_log "new-workspace directory status=$status destination=$destination"
             ((status == 2)) && continue
-            return 0
+            return 1
         }
+        WORKSPACE_DESTINATION=$destination
+        WORKSPACE_PATH=$path
+        WORKSPACE_SHELL=$shell
+        return
+    done
+}
+
+command_popup_new() {
+    local destination shell path suggested name target
+    local client=${TMUX_ATELIER_CLIENT:-}
+    while true; do
+        choose_workspace_target || return 0
+        destination=$WORKSPACE_DESTINATION
+        path=$WORKSPACE_PATH
+        shell=$WORKSPACE_SHELL
         suggested=$(normalise_name "$path")
         read -r -e -p 'Workspace name: ' -i "$suggested" name || continue
         debug_log "new-workspace name-submitted length=${#name} destination=$destination path=$(printf '%q' "$path")"
         target="$destination:$path"
-        command_new "$target" "$name" --detached
+        command_new "$target" "$name" --detached "$shell"
         if [[ -n $client ]]; then
             tmux_cmd switch-client -c "$client" -t "=$name"
         else
@@ -1618,12 +1774,19 @@ command_popup_rename() {
 }
 
 command_popup_edit() {
-    local name=${1:-} target
+    local name=${1:-} new destination path shell suggested target
     validate_name "$name"
-    ! session_exists "$name" || die "close the session before editing its target: $name"
     read_workspace "$name"
-    read -r -e -p 'Target: ' -i "$WORKSPACE_DESTINATION:$WORKSPACE_PATH" target || return 0
-    command_edit "$name" "$target"
+    choose_workspace_target || return 0
+    destination=$WORKSPACE_DESTINATION
+    path=$WORKSPACE_PATH
+    shell=$WORKSPACE_SHELL
+    suggested=$(normalise_name "$path" "$name" "$name")
+    debug_log "workspace-edit name-prompt name=$name suggested=$suggested"
+    read -r -e -p 'Workspace name: ' -i "$suggested" new || return 0
+    command_rename "$name" "$new"
+    target="$destination:$path"
+    command_edit "$new" "$target" "$shell"
 }
 
 usage() {

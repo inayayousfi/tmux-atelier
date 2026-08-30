@@ -142,10 +142,10 @@ PANE=$("$TMUX" display-message -p -t '=local-one:0' '#{pane_id}')
 "$CLI" split horizontal "$PANE"
 assert_equal 1 "$("$TMUX" list-panes -t '=local-one:0' -F '#{pane_width}' | sort -u | wc -l)" 'horizontal split stacks panes top and bottom'
 
-assert_fails 'live workspace target cannot be edited' "$CLI" edit local-one "local:$LOCAL_TWO"
+"$CLI" edit local-one "local:$LOCAL_TWO"
+assert_equal "$LOCAL_TWO" "$("$TMUX" show-options -qv -t '=local-one:' @atelier_path)" 'editing updates the live workspace target'
 "$CLI" close local-one
 assert_file "$STATE_DIR/workspaces/local-one" 'closing keeps the definition'
-"$CLI" edit local-one "local:$LOCAL_TWO"
 assert_equal "$LOCAL_CREATED" "$(stored_value "$STATE_DIR/workspaces/local-one" created)" 'editing preserves workspace order'
 "$CLI" open local-one --detached
 assert_equal "$LOCAL_TWO" "$("$TMUX" display-message -p -t '=local-one:' '#{pane_current_path}')" 'stopped workspace reopens with edited path'
@@ -157,16 +157,18 @@ assert_equal "$LOCAL_CREATED" "$(stored_value "$STATE_DIR/workspaces/renamed" cr
 "$TMUX" has-session -t '=renamed' || fail 'rename updates live tmux session'
 pass 'rename updates live tmux session'
 
-"$CLI" delete renamed
-assert_no_file "$STATE_DIR/workspaces/renamed" 'deleting removes only the definition'
-"$TMUX" has-session -t '=renamed' || fail 'deleting leaves the session alive'
-pass 'deleting leaves the session alive'
-
-assert_fails 'unsafe workspace names are rejected' "$CLI" new "local:$LOCAL_ONE" 'unsafe name' --detached
-assert_fails 'newlines in paths are rejected' "$CLI" new $'local:/tmp/bad\npath' newline --detached
 assert_fails 'extra arguments prevent destructive commands' "$CLI" close renamed unexpected
 "$TMUX" has-session -t '=renamed' || fail 'rejected close leaves the session alive'
 pass 'rejected close leaves the session alive'
+
+"$CLI" new "local:$LOCAL_ONE" delete-me --detached
+"$CLI" delete delete-me
+assert_no_file "$STATE_DIR/workspaces/delete-me" 'deleting removes the definition'
+assert_fails 'deleting stops a running workspace' "$TMUX" has-session -t '=delete-me'
+rm -f "$STATE_DIR/workspaces/renamed"
+
+assert_fails 'unsafe workspace names are rejected' "$CLI" new "local:$LOCAL_ONE" 'unsafe name' --detached
+assert_fails 'newlines in paths are rejected' "$CLI" new $'local:/tmp/bad\npath' newline --detached
 
 "$CLI" new "local:$LOCAL_ONE" conflict --detached
 "$CLI" close conflict
@@ -439,21 +441,23 @@ TMUX_ATELIER_FZF_CANCEL=1 \
 PATH="$ROOT/tests/fixtures:$PATH" \
     "$CLI" popup-workspace-menu workspace
 assert_contains "$(< "$MENU_FZF_LOG")" 'workspace > ' 'workspace actions use FZF'
-assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename workspace' 'workspace FZF menu offers rename'
-assert_contains "$(< "$MENU_INPUT_LOG")" 'Close workspace' 'workspace FZF menu offers close'
+assert_contains "$(< "$MENU_INPUT_LOG")" 'Edit workspace' 'workspace FZF menu offers editing'
+assert_contains "$(< "$MENU_INPUT_LOG")" 'Stop workspace' 'workspace FZF menu offers stop'
+assert_not_contains "$(< "$MENU_INPUT_LOG")" 'Open workspace' 'running workspace menu hides the redundant open action'
 
 : > "$COMMAND_LOG"
+printf '%s\n' 'Edit workspace' 'Rename workspace' > "$WIZARD_CHOICES"
 TMUX_ATELIER_STATE_DIR="$TEST_ROOT/menu-state" \
 TMUX_ATELIER_COMMAND_LOG="$COMMAND_LOG" \
 TMUX_ATELIER_CLI_FOR_TEST="$CLI" \
 TMUX_ATELIER_TMUX="$ROOT/tests/fixtures/tmux-log" \
 TMUX_ATELIER_FZF_LOG="$MENU_FZF_LOG" \
-TMUX_ATELIER_FZF_CHOICE='Rename workspace' \
+TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
 PATH="$ROOT/tests/fixtures:$PATH" \
     "$CLI" popup-workspace-menu native-session
 mapfile -d '' -t DEFERRED_RENAME_ARGS < "$COMMAND_LOG"
 assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'run-shell' 'native workspace rename is not mistaken for FZF cancellation'
-assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'request-rename' 'native workspace rename schedules its input popup'
+assert_contains "${DEFERRED_RENAME_ARGS[*]}" 'request-rename' 'workspace edit submenu schedules its rename popup'
 
 "$CLI" new "local:$LOCAL_ONE" close-current --detached
 sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=close-current' > "$TEST_ROOT/close-client.log" 2>&1 &
@@ -508,7 +512,7 @@ assert_contains "$(< "$MENU_FZF_LOG")" 'editor > ' 'tab actions use FZF'
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Rename tab' 'tab FZF menu offers rename'
 assert_contains "$(< "$MENU_INPUT_LOG")" 'Close tab' 'tab FZF menu offers close'
 
-sleep 20 | env -u TMUX "$TMUX" -C attach-session -t '=remote' > "$TEST_ROOT/wizard-client.log" 2>&1 &
+sleep 60 | env -u TMUX "$TMUX" -C attach-session -t '=remote' > "$TEST_ROOT/wizard-client.log" 2>&1 &
 WIZARD_CLIENT_PID=$!
 WIZARD_CLIENT=
 for _ in {1..10}; do
@@ -547,6 +551,22 @@ printf 'local-created\n' | \
 assert_directory "$WIZARD_HOME/new/project" 'typed local path is created recursively'
 assert_contains "$(< "$STATE_DIR/workspaces/local-created")" "path=$WIZARD_HOME/new/project" 'typed local path becomes the workspace target'
 
+printf '%s\n' 'Edit workspace' 'Change target' $'local\tLocal\tlocal' '__QUERY__' > "$WIZARD_CHOICES"
+: > "$WIZARD_INPUT_LOG"
+HOME="$WIZARD_HOME" \
+TMUX_ATELIER_FZF_QUERY="$TILDE_CHARACTER/edited/target" \
+TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-workspace-menu z-renamed <<< 'target-renamed'
+assert_contains "$(< "$WIZARD_INPUT_LOG")" 'Open workspace' 'stopped workspace menu offers open'
+assert_contains "$(< "$WIZARD_INPUT_LOG")" 'Delete workspace' 'saved workspace menu offers delete'
+assert_directory "$WIZARD_HOME/edited/target" 'workspace target editor uses the creation directory chooser'
+assert_contains "$(< "$STATE_DIR/debug.log")" 'suggested=target' 'workspace target editor recomputes the suggested name from the target'
+assert_no_file "$STATE_DIR/workspaces/z-renamed" 'workspace target editor applies the name prompt'
+assert_contains "$(< "$STATE_DIR/workspaces/target-renamed")" "path=$WIZARD_HOME/edited/target" 'workspace edit submenu changes the saved target'
+
 : > "$WIZARD_FZF_LOG"
 : > "$WIZARD_INPUT_LOG"
 printf '%s\n' $'alias\tincluded  deploy@app.internal:2200\tincluded' \
@@ -580,6 +600,37 @@ assert_contains "$(< "$STATE_DIR/workspaces/custom-wizard")" 'destination=custom
 assert_contains "$(< "$STATE_DIR/workspaces/custom-wizard")" 'path=/mnt/data' 'remote wizard accepts and validates an absolute custom path'
 mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
 assert_contains "${SSH_ARGS[*]}" 'mkdir -p' 'typed remote path is created recursively over SSH'
+
+printf '%s\n' $'custom\tCustom SSH destination\t' $'directory\twork dir' \
+    $'select\t< Select this folder>' > "$WIZARD_CHOICES"
+printf 'winhost\nwindows-wizard\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_contains "$(< "$STATE_DIR/workspaces/windows-wizard")" 'shell=windows' 'remote wizard detects native Windows OpenSSH'
+assert_contains "$(< "$STATE_DIR/workspaces/windows-wizard")" 'path=C:\Users\remote\work dir' 'Windows directory browser preserves native paths'
+mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
+assert_contains "${SSH_ARGS[*]}" 'powershell.exe' 'Windows workspaces start through PowerShell from Command Prompt SSH'
+
+printf '%s\n' $'custom\tCustom SSH destination\t' $'directory\t.config' \
+    $'select\t< Select this folder>' > "$WIZARD_CHOICES"
+printf 'pshost\npowershell-wizard\n' | \
+    HOME="$WIZARD_HOME" \
+    TMUX_ATELIER_CLIENT="$WIZARD_CLIENT" \
+    TMUX_ATELIER_FZF_LOG="$WIZARD_FZF_LOG" \
+    TMUX_ATELIER_FZF_INPUT_LOG="$WIZARD_INPUT_LOG" \
+    TMUX_ATELIER_FZF_CHOICES_FILE="$WIZARD_CHOICES" \
+    PATH="$ROOT/tests/fixtures:$PATH" \
+    "$CLI" popup-new
+assert_contains "$(< "$STATE_DIR/workspaces/powershell-wizard")" 'shell=powershell' 'remote wizard detects a PowerShell SSH login shell'
+assert_contains "$(< "$STATE_DIR/workspaces/powershell-wizard")" 'path=C:\Users\remote\.config' 'PowerShell directory browser preserves native paths'
+mapfile -d '' -t SSH_ARGS < "$SSH_LOG"
+assert_contains "${SSH_ARGS[-1]}" '-NoExit' 'PowerShell workspaces keep an interactive PowerShell session'
+assert_not_contains "${SSH_ARGS[-1]}" 'ComSpec' 'PowerShell workspaces do not switch to Command Prompt'
 
 printf '%s\n' $'alias\tcustom  remote@custom:22\tcustom' \
     $'select\t< Select this folder>' > "$WIZARD_CHOICES"

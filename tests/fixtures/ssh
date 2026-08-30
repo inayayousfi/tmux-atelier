@@ -4,6 +4,13 @@ set -euo pipefail
 : "${TMUX_ATELIER_SSH_LOG:?}"
 printf '%s\0' "$@" >> "$TMUX_ATELIER_SSH_LOG"
 
+windows=0
+powershell=0
+for argument in "$@"; do
+    [[ $argument == winhost ]] && windows=1
+    [[ $argument == pshost ]] && powershell=1
+done
+
 if [[ ${1:-} == -G ]]; then
     destination=${!#}
     case $destination in
@@ -22,6 +29,26 @@ for argument in "$@"; do
 done
 
 command=${!#}
+if ((powershell)) && [[ $command == \[Console\]* ]]; then
+    printf 'C:\\Users\\remote\r\n'
+    exit 0
+fi
+if ((windows || powershell)); then
+    [[ $command == powershell.exe* ]] || exit 1
+    if [[ $command == *'GetFolderPath'* ]]; then
+        printf 'C:\\Users\\remote\r\n'
+    elif [[ $command == *'Get-ChildItem'* ]]; then
+        if [[ $command == *"'C:\\Users\\remote\\work dir'"* ]]; then
+            printf '.hidden\r\n'
+        else
+            printf '.config\r\nwork dir\r\n'
+        fi
+    elif [[ $command == *'Resolve-Path'* ]]; then
+        printf 'C:\\Users\\remote\\new project\r\n'
+    fi
+    exit 0
+fi
+
 # Match the literal remote command; expansion happens on the fake remote.
 # shellcheck disable=SC2016
 if [[ $command == *'printf "%s\n" "$HOME"'* ]]; then
