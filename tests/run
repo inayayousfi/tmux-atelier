@@ -26,7 +26,13 @@ export TMUX_ATELIER_SSH_LOG="$SSH_LOG"
 export TMUX_ATELIER_TMUX="$TEST_BIN/tmux"
 export PATH="$TEST_BIN:$PATH"
 
-CLI="$ROOT/bin/tmux-atelier"
+if [[ -n ${TMUX_ATELIER_CLI_UNDER_TEST:-} ]]; then
+    CLI=$TMUX_ATELIER_CLI_UNDER_TEST
+else
+    cargo build --quiet --manifest-path "$ROOT/Cargo.toml"
+    CLI="$ROOT/target/debug/tmux-atelier"
+fi
+export TMUX_ATELIER_CLI="$CLI"
 TMUX="$TEST_BIN/tmux"
 TESTS=0
 
@@ -296,7 +302,7 @@ assert_contains "$WINDOW_LINE" '│' 'window line renders separators between tab
 "$CLI" refresh-status
 assert_contains "$("$TMUX" show-options -v -t '=remote:' 'status-format[0]')" 'range=window' 'status refresh keeps the tab line populated'
 assert_contains "$("$TMUX" list-keys -T prefix | grep -E 'bind-key +(-r +)?-T prefix +w ')" 'choose-tree' 'portable UI keeps the native tmux chooser'
-ATELIER_BINDINGS=$("$TMUX" list-keys -T prefix | grep -F "$ROOT/bin/tmux-atelier")
+ATELIER_BINDINGS=$("$TMUX" list-keys -T prefix | grep -F "$CLI")
 assert_contains "$ATELIER_BINDINGS" 'prefix C-n' 'plugin discovers a customized native new-window key'
 assert_not_contains "$ATELIER_BINDINGS" 'prefix c ' 'plugin does not hardcode the default new-window key'
 assert_contains "$ATELIER_BINDINGS" 'prefix \%' 'plugin reuses the native side-by-side split key'

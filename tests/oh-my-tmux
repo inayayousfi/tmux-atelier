@@ -10,6 +10,8 @@ STATE_DIR="$TEST_ROOT/state"
 SOCKET=tmux-atelier-oh-my-tmux
 TMUX_ARGS=(new-session -s omt-atelier)
 
+cargo build --quiet --manifest-path "$ROOT/Cargo.toml"
+
 if [[ ${1:-} == --detached ]]; then
     TMUX_ARGS+=(-d)
 elif (($#)); then

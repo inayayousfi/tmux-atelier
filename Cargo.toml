@@ -1,0 +1,20 @@
+[package]
+name = "tmux-atelier"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+glob = "0.3"
+libc = "0.2"
+regex = "1"
+rustyline = "15"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

@@ -3,7 +3,16 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-CLI="$ROOT/bin/tmux-atelier"
+if [[ -n ${TMUX_ATELIER_CLI:-} ]]; then
+    CLI=$TMUX_ATELIER_CLI
+elif [[ -x $ROOT/bin/tmux-atelier ]]; then
+    CLI="$ROOT/bin/tmux-atelier"
+elif [[ -x $ROOT/target/debug/tmux-atelier ]]; then
+    CLI="$ROOT/target/debug/tmux-atelier"
+else
+    printf 'tmux-atelier: binary not found; run cargo build or install a release\n' >&2
+    exit 1
+fi
 
 quote_sh() {
     local value=${1//\'/\'\\\'\'}

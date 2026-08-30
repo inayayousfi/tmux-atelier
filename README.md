@@ -1,22 +1,33 @@
+Written by inayayousfi, typed by GPT-5.6-SOL running in OpenCode.
+Every call here is inayayousfi's, and no agent acted on its own.
+
 # tmux-atelier
 
-tmux-atelier turns tmux sessions into local or remote workspaces. tmux keeps shells and processes alive. OpenSSH handles remote connections. The scripts in this repository only manage creation, navigation, and the metadata needed to reopen a target.
+tmux-atelier turns tmux sessions into local or remote workspaces. tmux keeps shells and processes alive. OpenSSH handles remote connections. The Rust binary manages creation, navigation, restoration, and the metadata needed to reopen a target. A small shell adapter connects it to tmux.
 
 A tmux session is a workspace, a window is a tab, and a pane is a split.
 
 ## Dependencies
 
-Running tmux-atelier requires Bash, tmux, OpenSSH, and fzf. ShellCheck is only needed for development checks.
+Running tmux-atelier requires tmux, OpenSSH, fzf, and Bash for the tmux adapter. Rust and ShellCheck are only needed for development.
 
 ## Installation
 
-The repository is self-contained. Add the following line as the last active line of your tmux configuration, replacing the path with the absolute path to the repository:
+Install the latest binary and tmux adapter under `${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux-atelier`:
 
-```tmux
-run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+```sh
+curl -fsSL https://raw.githubusercontent.com/inayayousfi/tmux-atelier/main/install.sh | bash
 ```
 
-It must be loaded last so that tmux-atelier can reuse the final key bindings and status-line sections installed by the rest of the configuration. Reload the configuration or restart the tmux server. The plugin enables mouse support and installs its two-line workspace interface, but preserves the existing prefix, status-bar position, colors, and key bindings.
+The installer detects Linux x86-64, Linux ARM64, or macOS Apple Silicon, verifies the release checksum, and replaces an older installation atomically. It does not edit tmux configuration. Add the line it prints as the last active line of `${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf`:
+
+```tmux
+run-shell ~/.config/tmux/tmux-atelier/tmux-atelier.tmux
+```
+
+Use the exact absolute path printed by the installer when `XDG_CONFIG_HOME` is set. The adapter must be loaded last so tmux-atelier can reuse the final key bindings and status-line sections installed by the rest of the configuration. Reload the configuration or restart the tmux server. The plugin enables mouse support and installs its two-line workspace interface, but preserves the existing prefix, status-bar position, colors, and key bindings.
+
+To run directly from a source checkout, build the binary first with `cargo build`. The adapter finds `target/debug/tmux-atelier` when an installed `bin/tmux-atelier` is absent.
 
 `.tmux.conf.example` shows the supported plugin options and loads the plugin. It does not change the prefix, status-bar position, or theme, and it is never loaded automatically.
 
@@ -24,12 +35,12 @@ It must be loaded last so that tmux-atelier can reuse the final key bindings and
 
 tmux-atelier can be loaded from an Oh My Tmux `.tmux.conf.local`. Its first line keeps the configured Oh My Tmux `status-left` and `status-right` sections and replaces the central window list with tmux-atelier tabs. The second line contains the workspaces.
 
-Keep the `run-shell` command as the final active tmux command in `.tmux.conf.local`, after theme options, custom bindings, and TPM plugin declarations:
+Keep the `run-shell` command as the final active tmux command in `.tmux.conf.local`, after theme options, custom bindings, and Tmux Plugin Manager declarations:
 
 ```tmux
 set-option -g @atelier_restore prompt
 set-option -g @atelier_status_sides on
-run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+run-shell ~/.config/tmux/tmux-atelier/tmux-atelier.tmux
 ```
 
 `@atelier_status_sides` is disabled by default so a regular tmux configuration does not show tmux's default session name, pane title, and date around the tabs.
@@ -77,13 +88,14 @@ name=prod
 destination=deploy@app01
 path=/srv/app
 created=1787911200
+shell=posix
 ```
 
 Names may contain ASCII letters, digits, `_`, and `-`. When no name is given, tmux-atelier normalizes the final path component and adds a numeric suffix to avoid a collision.
 
 The `created` value keeps workspaces in creation order. Older definitions without it use their file modification time. Renaming a workspace preserves this value and its position. Native tmux sessions are merged into the same line using their tmux creation time.
 
-A definition and its live session are separate. `close` stops the session but keeps its definition. When a client is using that workspace, it switches to another live workspace first, or opens another saved workspace when necessary. `delete` removes the definition but leaves a live session alone.
+A definition and its live session are separate. `close` stops the session but keeps its definition. When a client is using that workspace, it switches to another live workspace first, or opens another saved workspace when necessary. `delete` stops a running session with the same safety checks and then removes the definition.
 
 Every new native tmux session is adopted as a local workspace. tmux-atelier reads the first pane's canonical working directory, reuses a saved workspace that already points there, or creates a new definition whose name comes from the directory name. If the matching workspace is already running, the temporary session is removed and its client switches to the existing workspace.
 
@@ -92,37 +104,37 @@ Every new native tmux session is adopted as a local workspace. tmux-atelier read
 Create and open a local workspace:
 
 ```sh
-bin/tmux-atelier new local:/home/user/Projects/demo demo
+~/.config/tmux/tmux-atelier/bin/tmux-atelier new local:/home/user/Projects/demo demo
 ```
 
 Create and open a remote workspace:
 
 ```sh
-bin/tmux-atelier new deploy@app01:/srv/app prod
+~/.config/tmux/tmux-atelier/bin/tmux-atelier new deploy@app01:/srv/app prod
 ```
 
 Reopen a saved workspace whose session has stopped:
 
 ```sh
-bin/tmux-atelier open prod
+~/.config/tmux/tmux-atelier/bin/tmux-atelier open prod
 ```
 
 The remaining management commands are:
 
 ```sh
-bin/tmux-atelier rename OLD NEW
-bin/tmux-atelier edit NAME destination:path
-bin/tmux-atelier close NAME
-bin/tmux-atelier delete NAME
+~/.config/tmux/tmux-atelier/bin/tmux-atelier rename OLD NEW
+~/.config/tmux/tmux-atelier/bin/tmux-atelier edit NAME destination:path
+~/.config/tmux/tmux-atelier/bin/tmux-atelier close NAME
+~/.config/tmux/tmux-atelier/bin/tmux-atelier delete NAME
 ```
 
-A target cannot be edited while its session is alive. Close the session before running `edit`. This prevents old and new targets from being mixed in one session.
+Editing a live workspace updates the saved definition and the session metadata used by new tabs and splits. Existing panes keep running at their current locations.
 
 ## tmux Interface
 
 The first status line shows the windows in the active session and ends with a `+` button for creating a tab on the same target. New tabs are appended after the last existing tab, even when an earlier numeric index is free.
 
-The second status line shows saved workspaces and native tmux sessions in creation order. By default, the current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens an FZF menu for renaming, closing, or deleting its saved definition. Right-clicking a tab opens an FZF menu for renaming or closing it. Destructive actions require confirmation.
+The second status line shows saved workspaces and native tmux sessions in creation order. By default, the current workspace uses reverse video, a live session is bold, and a stopped definition is dim. Its `+` button opens the creation popup. Left-clicking a workspace opens or selects it. Right-clicking opens an FZF menu for editing, stopping, or deleting it. Stopped workspaces also offer an explicit open action. Right-clicking a tab opens an FZF menu for renaming or closing it. Destructive actions require confirmation.
 
 The outer terminal title follows the active tab and workspace target using `tab - workspace@destination`. Its default format is `#W - #S@#{@atelier_destination}`, where `#W` expands to the active tab name, `#S` expands to the workspace name, and `#{@atelier_destination}` expands to `local` or the SSH destination. Set `@atelier_terminal_title` before loading the plugin to customize this tmux format string. Set `@atelier_separator` and `@atelier_tab_separator` to change the separators shown before, between, and after workspaces and tabs. Advanced tmux styles are available through `@atelier_workspace_active_style`, `@atelier_workspace_live_style`, `@atelier_workspace_stopped_style`, `@atelier_tab_style`, `@atelier_tab_active_style`, and `@atelier_add_style`.
 
@@ -153,7 +165,7 @@ Choose the startup policy before loading the plugin:
 
 ```tmux
 set-option -g @atelier_restore prompt
-run-shell /path/to/tmux-atelier/tmux-atelier.tmux
+run-shell ~/.config/tmux/tmux-atelier/tmux-atelier.tmux
 ```
 
 The accepted values are:
@@ -189,17 +201,31 @@ tmux show-options -t NAME: @atelier_destination
 tmux show-options -t NAME: @atelier_path
 ```
 
+## Development
+
+The Rust implementation is divided by responsibility: command lifecycle, tabs and panes, status and menus, restoration and adoption, workspace persistence, snapshot persistence, process adapters, and the target wizard. The application context carries configured state paths and adapters through those modules.
+
+Build and run the Rust checks with:
+
+```sh
+cargo build
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
 ## Tests
 
 The test suite uses an isolated tmux server, state directory, and fake SSH client. It does not touch real sessions or definitions.
 
 ```sh
 ./tests/run
+./tests/install
 ```
 
 Run the static checks with:
 
 ```sh
-bash -n bin/tmux-atelier tmux-atelier.tmux tests/run
-shellcheck bin/tmux-atelier tmux-atelier.tmux tests/run tests/fixtures/fzf tests/fixtures/ssh tests/fixtures/tmux tests/fixtures/tmux-log tests/fixtures/tmux-ui
+bash -n install.sh tmux-atelier.tmux tests/install tests/run
+shellcheck install.sh tmux-atelier.tmux tests/install tests/run tests/fixtures/fzf tests/fixtures/ssh tests/fixtures/tmux tests/fixtures/tmux-log tests/fixtures/tmux-ui
 ```
