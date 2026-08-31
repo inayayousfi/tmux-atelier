@@ -16,6 +16,7 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
         ("@atelier_tab_separator", "│"),
         ("@atelier_restore", "prompt"),
         ("@atelier_status_sides", "off"),
+        ("@atelier_new_workspace_key", "N"),
         ("@atelier_terminal_title", "#W - #S@#{@atelier_destination}"),
     ] {
         set_default(app, option, value)?;
@@ -98,6 +99,7 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
     )?;
 
     replace_native_bindings(app, &cli.to_string_lossy(), &executable)?;
+    configure_new_workspace_binding(app, &cli.to_string_lossy(), &executable)?;
     restore::arm(app)?;
 
     let refresh = format!("run-shell -b \"{}\"", internal("refresh-status"));
@@ -182,6 +184,50 @@ fn set_default(app: &App, option: &str, value: &str) -> Result<()> {
 
 fn set(app: &App, option: &str, value: &str) -> Result<()> {
     process::tmux(app, &["set-option", "-gq", option, value])
+}
+
+fn configure_new_workspace_binding(app: &App, cli: &str, executable: &str) -> Result<()> {
+    let option =
+        |name: &str| process::tmux_quiet(app, &["show-options", "-gqv", name]).unwrap_or_default();
+    let key = option("@atelier_new_workspace_key");
+    let previous = option("@atelier_new_workspace_bound_key");
+    if !previous.is_empty() && owned_popup_binding(app, &previous, cli)? {
+        process::tmux(app, &["unbind-key", &previous])?;
+    }
+    if key == "off" {
+        return set(app, "@atelier_new_workspace_bound_key", "");
+    }
+    process::tmux(
+        app,
+        &[
+            "bind-key",
+            &key,
+            "display-popup",
+            "-E",
+            "-w",
+            "70%",
+            "-h",
+            "60%",
+            &format!("exec {executable} internal popup-new"),
+        ],
+    )?;
+    set(app, "@atelier_new_workspace_bound_key", &key)
+}
+
+fn owned_popup_binding(app: &App, key: &str, cli: &str) -> Result<bool> {
+    let bindings = process::tmux_output(app, &["list-keys", "-T", "prefix"])?;
+    Ok(bindings.lines().any(|binding| {
+        let fields = binding.split_whitespace().collect::<Vec<_>>();
+        let Some(table) = fields.iter().position(|field| *field == "-T") else {
+            return false;
+        };
+        fields
+            .get(table + 2)
+            .map(|value| value.trim_start_matches('\\'))
+            == Some(key)
+            && binding.contains(cli)
+            && binding.contains("internal popup-new")
+    }))
 }
 
 fn replace_native_bindings(app: &App, cli: &str, executable: &str) -> Result<()> {

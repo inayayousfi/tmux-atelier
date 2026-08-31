@@ -4,6 +4,9 @@
 # Startup restoration: prompt, always, or never.
 set-option -g @atelier_restore prompt
 
+# Prefix shortcut for creating a workspace. Use 'off' to disable it.
+set-option -g @atelier_new_workspace_key N
+
 # Separators shown before, between, and after workspaces and tabs.
 set-option -g @atelier_separator '│'
 set-option -g @atelier_tab_separator '│'

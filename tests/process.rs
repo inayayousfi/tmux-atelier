@@ -286,6 +286,8 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     assert!(keys.contains("navigate-tab previous"), "{keys}");
     assert!(keys.contains("navigate-workspace next"), "{keys}");
     assert!(keys.contains("navigate-workspace previous"), "{keys}");
+    assert!(keys.contains("prefix N"), "{keys}");
+    assert!(keys.contains("internal popup-new"), "{keys}");
     let workspace_status =
         env.tmux_text(["show-options", "-qv", "-t", "=native:", "status-format[1]"]);
     assert!(workspace_status.contains("list=focus"));
@@ -295,6 +297,15 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     assert!(hooks.contains("internal snapshot"));
     assert!(hooks.contains("internal restore-start"));
     assert!(hooks.contains("internal adopt-session"));
+
+    env.tmux_ok(["set-option", "-g", "@atelier_new_workspace_key", "off"]);
+    let output = env
+        .command(&env.repo.join("tmux-atelier.tmux"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let keys = env.tmux_text(["list-keys", "-T", "prefix"]);
+    assert!(!keys.contains("internal popup-new"), "{keys}");
 }
 
 #[test]

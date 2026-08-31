@@ -16,6 +16,7 @@ set-option -g status-justify left
 
 set-option -g @atelier_restore never
 set-option -g @atelier_status_sides on
+set-option -g @atelier_new_workspace_key N
 set-option -g @atelier_separator '│'
 set-option -g @atelier_tab_separator '│'
 
