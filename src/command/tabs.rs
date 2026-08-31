@@ -1,6 +1,6 @@
-use super::{ui, App};
+use super::{App, ui};
 use crate::app::Direction;
-use crate::{err, process, workspace, Result};
+use crate::{Result, err, process, workspace};
 
 pub(super) fn navigate(app: &App, direction: Direction, session: &str) -> Result<()> {
     let flag = match direction {

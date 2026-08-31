@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 
 use glob::glob;
 
-use crate::config::{quote_powershell, quote_sh, Config};
+use crate::config::{Config, quote_powershell, quote_sh};
 use crate::interaction::Interaction;
 use crate::process;
 use crate::workspace::{self, is_windows_shell};
-use crate::{err, Result};
+use crate::{Result, err};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Target {
@@ -70,7 +70,7 @@ pub fn choose_target(config: &Config, interaction: &dyn Interaction) -> Result<O
                     destination,
                     path,
                     shell,
-                }))
+                }));
             }
             DirectoryChoice::Back => continue,
             DirectoryChoice::Cancelled => return Ok(None),
@@ -352,16 +352,16 @@ fn alias_choice(config: &Config, alias: &str) -> Result<Option<String>> {
 
 fn remote_connection(config: &Config, destination: &str) -> Result<(String, String)> {
     let direct = "[Console]::Out.WriteLine([Environment]::GetFolderPath('UserProfile'))";
-    if let Ok(home) = process::ssh_output(config, destination, direct, true) {
-        if !home.is_empty() {
-            return Ok(("powershell".into(), home.trim_end_matches('\r').into()));
-        }
+    if let Ok(home) = process::ssh_output(config, destination, direct, true)
+        && !home.is_empty()
+    {
+        return Ok(("powershell".into(), home.trim_end_matches('\r').into()));
     }
     let cmd = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::Out.WriteLine([Environment]::GetFolderPath('UserProfile'))\"";
-    if let Ok(home) = process::ssh_output(config, destination, cmd, true) {
-        if !home.is_empty() {
-            return Ok(("windows".into(), home.trim_end_matches('\r').into()));
-        }
+    if let Ok(home) = process::ssh_output(config, destination, cmd, true)
+        && !home.is_empty()
+    {
+        return Ok(("windows".into(), home.trim_end_matches('\r').into()));
     }
     let home = process::ssh_output(config, destination, "printf \"%s\\n\" \"$HOME\"", false)?;
     if home.is_empty() {
@@ -475,7 +475,10 @@ fn remote_directories(
     shell: &str,
 ) -> Result<Vec<String>> {
     let remote = if is_windows_shell(shell) {
-        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); Get-ChildItem -LiteralPath {} -Force -Directory | ForEach-Object {{ [Console]::Out.WriteLine($_.Name) }}\"", quote_powershell(path))
+        format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); Get-ChildItem -LiteralPath {} -Force -Directory | ForEach-Object {{ [Console]::Out.WriteLine($_.Name) }}\"",
+            quote_powershell(path)
+        )
     } else {
         let inner = "cd -- \"$1\" 2>/dev/null || exit 1\nfor entry in ./* ./.[!.]* ./..?*; do\n    [ -d \"$entry\" ] || continue\n    name=${entry#./}\n    case $name in *\"\n\"*) continue ;; esac\n    printf \"%s\\n\" \"$name\"\ndone";
         format!("sh -c {} sh {}", quote_sh(inner), quote_sh(path))
@@ -499,7 +502,11 @@ fn create_remote_path(
     shell: &str,
 ) -> Result<String> {
     let remote = if is_windows_shell(shell) {
-        format!("powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); New-Item -ItemType Directory -Force -LiteralPath {} | Out-Null; [Console]::Out.WriteLine((Resolve-Path -LiteralPath {}).Path)\"", quote_powershell(path), quote_powershell(path))
+        format!(
+            "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); New-Item -ItemType Directory -Force -LiteralPath {} | Out-Null; [Console]::Out.WriteLine((Resolve-Path -LiteralPath {}).Path)\"",
+            quote_powershell(path),
+            quote_powershell(path)
+        )
     } else {
         let inner = r#"mkdir -p -- "$1" && cd -- "$1" && pwd -P"#;
         format!("sh -c {} sh {}", quote_sh(inner), quote_sh(path))

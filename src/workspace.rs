@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::process;
-use crate::{err, Result};
+use crate::{Result, err};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Workspace {
@@ -345,10 +345,10 @@ pub fn all_names(config: &Config) -> Result<Vec<String>> {
         &["list-sessions", "-F", "#{session_created}\t#{session_name}"],
     ) {
         for line in sessions.lines() {
-            if let Some((created, name)) = line.split_once('\t') {
-                if !definition_set.contains(name) {
-                    ordered.push((created.parse().unwrap_or(0.0), name.into()));
-                }
+            if let Some((created, name)) = line.split_once('\t')
+                && !definition_set.contains(name)
+            {
+                ordered.push((created.parse().unwrap_or(0.0), name.into()));
             }
         }
     }

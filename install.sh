@@ -2,17 +2,50 @@
 
 # Installs the latest release without modifying tmux configuration.
 #
-# Usage: ./install.sh
+# Usage: ./install.sh [--install-dir DIRECTORY]
 # Default destination: ${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux-atelier
 # Test/local overrides: TMUX_ATELIER_INSTALL_DIR, TMUX_ATELIER_RELEASE_BASE_URL,
 # TMUX_ATELIER_UNAME_S, and TMUX_ATELIER_UNAME_M.
 
 set -euo pipefail
 
-if (($#)); then
-    printf 'usage: %s\n' "$0" >&2
-    exit 2
-fi
+usage() {
+    printf 'usage: %s [-d|--install-dir DIRECTORY]\n' "$0"
+}
+
+install_dir=${TMUX_ATELIER_INSTALL_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux-atelier}
+
+while (($#)); do
+    case $1 in
+        -d | --install-dir)
+            if (($# < 2)) || [[ -z $2 ]]; then
+                printf '%s requires a directory\n' "$1" >&2
+                usage >&2
+                exit 2
+            fi
+            install_dir=$2
+            shift 2
+            ;;
+        --install-dir=*)
+            install_dir=${1#*=}
+            if [[ -z $install_dir ]]; then
+                printf '%s requires a directory\n' "${1%%=*}" >&2
+                usage >&2
+                exit 2
+            fi
+            shift
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'unknown argument: %s\n' "$1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
 os=${TMUX_ATELIER_UNAME_S:-$(uname -s)}
 arch=${TMUX_ATELIER_UNAME_M:-$(uname -m)}
@@ -33,7 +66,6 @@ case "$os:$arch" in
         ;;
 esac
 
-install_dir=${TMUX_ATELIER_INSTALL_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux-atelier}
 release_base=${TMUX_ATELIER_RELEASE_BASE_URL:-https://github.com/inayayousfi/tmux-atelier/releases/latest/download}
 archive=tmux-atelier-${platform}.tar.gz
 parent=${install_dir%/*}

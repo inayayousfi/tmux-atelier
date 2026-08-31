@@ -189,11 +189,13 @@ mod tests {
         let config = select_render_config();
         assert_eq!(config.highlighted_option_prefix.content, "  ❯");
         assert_eq!(config.unhighlighted_option_prefix.content, "   ");
-        assert!(config
-            .selected_option
-            .unwrap()
-            .att
-            .contains(Attributes::BOLD));
+        assert!(
+            config
+                .selected_option
+                .unwrap()
+                .att
+                .contains(Attributes::BOLD)
+        );
         assert_eq!(page_size_for_rows(30), 27);
         assert_eq!(page_size_for_rows(3), 1);
     }

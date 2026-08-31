@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
 use std::process::{Command, Output, Stdio};
 
-use crate::config::{quote_powershell, quote_sh, Config};
-use crate::{err, Result};
+use crate::config::{Config, quote_powershell, quote_sh};
+use crate::{Result, err};
 
 pub fn run<I, S>(program: &str, args: I) -> Result<()>
 where

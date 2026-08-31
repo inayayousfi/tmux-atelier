@@ -4,8 +4,8 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
-use super::{ui, App};
-use crate::{err, process, wizard, workspace, Result};
+use super::{App, ui};
+use crate::{Result, err, process, wizard, workspace};
 use workspace::Workspace;
 
 pub(super) fn new(app: &App, args: &[String], requested_shell: Option<&str>) -> Result<()> {

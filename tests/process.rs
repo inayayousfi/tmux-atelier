@@ -76,14 +76,15 @@ impl TestEnv {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        assert!(self
-            .command(&self.cli)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            self.command(&self.cli)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn tmux<I, S>(&self, args: I) -> Output
@@ -99,14 +100,15 @@ impl TestEnv {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        assert!(self
-            .command(&self.tmux)
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            self.command(&self.tmux)
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn tmux_text<I, S>(&self, args: I) -> String
@@ -382,10 +384,11 @@ fn tab_menu_actions_rename_and_delete_windows() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(env
-        .tmux(["display-message", "-p", "-t", &window])
-        .status
-        .success());
+    assert!(
+        env.tmux(["display-message", "-p", "-t", &window])
+            .status
+            .success()
+    );
 
     let accept = env.scripted("confirm\ttrue\n");
     let output = env
@@ -395,10 +398,11 @@ fn tab_menu_actions_rename_and_delete_windows() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(!env
-        .tmux_text(["list-windows", "-t", "=tab-actions", "-F", "#{window_id}"])
-        .lines()
-        .any(|id| id == window));
+    assert!(
+        !env.tmux_text(["list-windows", "-t", "=tab-actions", "-F", "#{window_id}"])
+            .lines()
+            .any(|id| id == window)
+    );
 }
 
 #[test]
@@ -450,9 +454,11 @@ fn scripted_wizard_edits_and_renames_workspace() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    assert!(fs::read_to_string(env.workspace("collision"))
-        .unwrap()
-        .contains(&format!("path={}", collision.display())));
+    assert!(
+        fs::read_to_string(env.workspace("collision"))
+            .unwrap()
+            .contains(&format!("path={}", collision.display()))
+    );
 }
 
 #[test]
@@ -487,12 +493,16 @@ fn wizard_recovers_and_remembers_ssh_destinations() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(fs::read_to_string(env.workspace("from-history"))
-        .unwrap()
-        .contains("destination=history@winhost"));
-    assert!(fs::read_to_string(history_log)
-        .unwrap()
-        .contains("Modèles/"));
+    assert!(
+        fs::read_to_string(env.workspace("from-history"))
+            .unwrap()
+            .contains("destination=history@winhost")
+    );
+    assert!(
+        fs::read_to_string(history_log)
+            .unwrap()
+            .contains("Modèles/")
+    );
 
     let custom = env.scripted(
         "choose\tCustom SSH destination\ninput\tremembered@app.example\nchoose\t[ Select this folder ]\ninput\tremembered\n",
@@ -612,10 +622,11 @@ fn snapshot_restores_windows_and_panes() {
     env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
     env.ok(["internal", "restore-arm"]);
     env.ok(["internal", "restore-start"]);
-    assert!(env
-        .tmux(["has-session", "-t", "=restored"])
-        .status
-        .success());
+    assert!(
+        env.tmux(["has-session", "-t", "=restored"])
+            .status
+            .success()
+    );
     assert_eq!(
         env.tmux_text(["list-windows", "-t", "=restored", "-F", "#{window_id}"])
             .lines()

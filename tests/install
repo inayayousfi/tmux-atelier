@@ -107,6 +107,16 @@ output=$(env \
 assert_equal "run-shell '$xdg/tmux/tmux-atelier/tmux-atelier.tmux'" "$output" 'XDG_CONFIG_HOME controls the default path'
 assert_file_content 'keep this config' "$tmux_config" 'installer does not modify tmux configuration'
 
+custom_dir="$TEST_ROOT/custom directory"
+output=$(env \
+    TMUX_ATELIER_UNAME_S=Linux \
+    TMUX_ATELIER_UNAME_M=x86_64 \
+    TMUX_ATELIER_RELEASE_BASE_URL="file://$RELEASES" \
+    TMUX_ATELIER_INSTALL_DIR="$TEST_ROOT/ignored-environment-directory" \
+    "$ROOT/install.sh" --install-dir "$custom_dir")
+assert_equal "run-shell '$custom_dir/tmux-atelier.tmux'" "$output" '--install-dir chooses a custom destination'
+assert_file_content 'linux-x86_64 plugin' "$custom_dir/tmux-atelier.tmux" '--install-dir installs the plugin in the custom destination'
+
 space_dir="$TEST_ROOT/path with spaces"
 output=$(run_installer Linux x86_64 "$space_dir")
 assert_equal "run-shell '$space_dir/tmux-atelier.tmux'" "$output" 'printed tmux command quotes an installation path with spaces'

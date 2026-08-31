@@ -1,9 +1,9 @@
 use std::env;
 
-use super::{lifecycle, tabs, App};
+use super::{App, lifecycle, tabs};
 use crate::app::Direction;
 use crate::config::quote_sh;
-use crate::{process, workspace, Result};
+use crate::{Result, process, workspace};
 
 pub(super) fn refresh_status(app: &App) -> Result<()> {
     let status_format = process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_tabs_format"])

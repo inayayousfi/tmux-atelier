@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use super::{restore, ui, App};
+use super::{App, restore, ui};
 use crate::config::quote_sh;
-use crate::{process, Result};
+use crate::{Result, process};
 
 pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
     for (option, value) in [
@@ -33,7 +33,9 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
         "{separator}#{{W:#[range=window|#{{window_index}} {tab_style}] #I #W #[norange default]{separator},#[list=focus range=window|#{{window_index}} {active_style}] #I #W #[norange default]{separator}#[list=on]}}#[range=user|new-tab {add_style}] + #[default,norange]"
     );
     let status = if option("@atelier_status_sides") == "on" {
-        format!("#[align=left range=left #{{E:status-left-style}}]#[push-default]#{{T;=/#{{status-left-length}}:status-left}}#[pop-default]#[norange default]#[list=on align=#{{status-justify}}]{tabs}#[nolist align=right range=right #{{E:status-right-style}}]#[push-default]#{{T;=/#{{status-right-length}}:status-right}}#[pop-default]#[norange default]")
+        format!(
+            "#[align=left range=left #{{E:status-left-style}}]#[push-default]#{{T;=/#{{status-left-length}}:status-left}}#[pop-default]#[norange default]#[list=on align=#{{status-justify}}]{tabs}#[nolist align=right range=right #{{E:status-right-style}}]#[push-default]#{{T;=/#{{status-right-length}}:status-right}}#[pop-default]#[norange default]"
+        )
     } else {
         format!("#[list=on align=left]{tabs}#[nolist]")
     };

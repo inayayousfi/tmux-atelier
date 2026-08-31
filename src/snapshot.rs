@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::process;
 use crate::workspace::{self, Workspace};
-use crate::{err, Result};
+use crate::{Result, err};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {

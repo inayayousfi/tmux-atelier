@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-use crate::command::App;
 use crate::Result;
+use crate::command::App;
 
 #[derive(Parser)]
 #[command(

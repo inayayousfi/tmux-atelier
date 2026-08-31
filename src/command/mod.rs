@@ -10,7 +10,7 @@ use std::ops::Deref;
 use crate::app::{Command, InternalCommand};
 use crate::config::Config;
 use crate::interaction::{self, Interaction};
-use crate::{err, process, snapshot, workspace, Result};
+use crate::{Result, err, process, snapshot, workspace};
 
 pub(crate) struct App {
     config: Config,

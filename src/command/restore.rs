@@ -3,9 +3,9 @@ use std::io::{self, Read, Write};
 use std::thread;
 use std::time::Duration;
 
-use super::{ui, App};
+use super::{App, ui};
 use crate::config::quote_sh;
-use crate::{err, process, snapshot, workspace, Result};
+use crate::{Result, err, process, snapshot, workspace};
 use workspace::Workspace;
 
 pub(super) fn adopt(app: &App, session: &str, client: Option<&str>) -> Result<()> {
@@ -142,15 +142,14 @@ pub(super) fn discard(app: &App, client: Option<&str>) -> Result<()> {
     app.set_global("@atelier_restore_handled", "1")?;
     app.set_global("@atelier_restore_started", "1")?;
     app.snapshot("", "")?;
-    if let Some(client) = client.filter(|value| !value.is_empty()) {
-        if let Some(session) = process::tmux_quiet(
+    if let Some(client) = client.filter(|value| !value.is_empty())
+        && let Some(session) = process::tmux_quiet(
             app,
             &["display-message", "-p", "-c", client, "#{session_name}"],
         )
         .filter(|value| !value.is_empty())
-        {
-            adopt(app, &session, Some(client))?;
-        }
+    {
+        adopt(app, &session, Some(client))?;
     }
     Ok(())
 }
