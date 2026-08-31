@@ -1,6 +1,7 @@
 use std::env;
 
 use super::{lifecycle, tabs, App};
+use crate::app::Direction;
 use crate::config::quote_sh;
 use crate::{process, workspace, Result};
 
@@ -51,7 +52,7 @@ fn status_line_for(app: &App, active: &str) -> Result<String> {
     let stopped_style = option("@atelier_workspace_stopped_style", "dim");
     let add_style = option("@atelier_add_style", "bold");
     let separator = option("@atelier_separator", "│").replace('#', "##");
-    let mut line = separator.clone();
+    let mut line = format!("#[list=on align=left]{separator}");
     for (index, name) in workspace::all_names(app)?.into_iter().enumerate() {
         let token = format!("a{index}");
         process::tmux(
@@ -71,14 +72,54 @@ fn status_line_for(app: &App, active: &str) -> Result<String> {
         } else {
             &stopped_style
         };
+        let focus = if name == active { "#[list=focus]" } else { "" };
+        let unfocus = if name == active { "#[list=on]" } else { "" };
         line.push_str(&format!(
-            "#[range=user|{token},{style}] {label} #[default,norange]{separator}"
+            "{focus}#[range=user|{token},{style}] {label} #[default,norange]{separator}{unfocus}"
         ));
     }
     line.push_str(&format!(
-        "#[range=user|new,{add_style}] + #[default,norange]"
+        "#[range=user|new,{add_style}] + #[default,norange]#[nolist]"
     ));
     Ok(line)
+}
+
+pub(super) fn navigate_workspace(
+    app: &App,
+    direction: Direction,
+    active: &str,
+    client: Option<&str>,
+) -> Result<()> {
+    let names = workspace::all_names(app)?;
+    let Some(target) = adjacent_name(&names, active, direction) else {
+        return Ok(());
+    };
+    if target == active {
+        return Ok(());
+    }
+    if !workspace::session_exists(app, target) {
+        lifecycle::open(app, target, Some("--detached"))?;
+    }
+    let mut owned = vec!["switch-client".to_owned()];
+    if let Some(client) = client.filter(|value| !value.is_empty()) {
+        owned.extend(["-c".into(), client.into()]);
+    }
+    owned.extend(["-t".into(), format!("={target}")]);
+    process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+fn adjacent_name<'a>(names: &'a [String], active: &str, direction: Direction) -> Option<&'a str> {
+    let fallback = match direction {
+        Direction::Next => names.first(),
+        Direction::Previous => names.last(),
+    }?;
+    let Some(index) = names.iter().position(|name| name == active) else {
+        return Some(fallback);
+    };
+    Some(match direction {
+        Direction::Next => &names[(index + 1) % names.len()],
+        Direction::Previous => &names[(index + names.len() - 1) % names.len()],
+    })
 }
 
 fn workspace_label(app: &App, name: &str) -> String {
@@ -368,4 +409,29 @@ pub(super) fn popup_request(
         command,
     ]);
     process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adjacent_name;
+    use crate::app::Direction;
+
+    #[test]
+    fn adjacent_workspace_wraps_and_handles_an_unknown_active_name() {
+        let names = vec!["one".into(), "two".into(), "three".into()];
+        assert_eq!(
+            adjacent_name(&names, "one", Direction::Previous),
+            Some("three")
+        );
+        assert_eq!(adjacent_name(&names, "three", Direction::Next), Some("one"));
+        assert_eq!(
+            adjacent_name(&names, "missing", Direction::Next),
+            Some("one")
+        );
+        assert_eq!(
+            adjacent_name(&names, "missing", Direction::Previous),
+            Some("three")
+        );
+        assert_eq!(adjacent_name(&[], "missing", Direction::Next), None);
+    }
 }

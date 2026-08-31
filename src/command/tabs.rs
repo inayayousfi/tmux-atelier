@@ -1,5 +1,14 @@
 use super::{ui, App};
+use crate::app::Direction;
 use crate::{err, process, workspace, Result};
+
+pub(super) fn navigate(app: &App, direction: Direction, session: &str) -> Result<()> {
+    let flag = match direction {
+        Direction::Next => "-n",
+        Direction::Previous => "-p",
+    };
+    process::tmux(app, &["select-window", flag, "-t", &format!("={session}:")])
+}
 
 pub(super) fn window(app: &App, session: Option<&str>) -> Result<()> {
     let session = match session {

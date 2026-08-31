@@ -89,6 +89,14 @@ impl App {
             InternalCommand::PopupRename { name } => lifecycle::popup_rename(self, &name),
             InternalCommand::PopupEdit { name } => lifecycle::popup_edit(self, &name),
             InternalCommand::RefreshStatus => ui::refresh_status(self),
+            InternalCommand::NavigateTab { direction, session } => {
+                tabs::navigate(self, direction, &session)
+            }
+            InternalCommand::NavigateWorkspace {
+                direction,
+                session,
+                client,
+            } => ui::navigate_workspace(self, direction, &session, client.as_deref()),
             InternalCommand::StatusClick {
                 token,
                 client,

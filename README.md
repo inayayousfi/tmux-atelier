@@ -147,14 +147,18 @@ tmux-atelier finds the keys currently assigned to native window, split, and rena
 
 ```text
 c    create a tab on the workspace target
+n    select the next tab
+p    select the previous tab
 %    split the current pane left and right on the same target
 "    split the current pane top and bottom on the same target
 ,    rename the current tab
 &    close the current tab and update the restore snapshot
 $    rename the current workspace and its saved definition
+)    select the next workspace
+(    select the previous workspace
 ```
 
-Custom keys already assigned to these native actions are reused in the same way. The plugin does not change the prefix or navigation keys. Commands without a tmux-atelier equivalent, including the native chooser on `w`, retain their normal tmux behavior.
+Custom keys already assigned to these native actions are reused in the same way. Workspace navigation follows the full creation-ordered Atelier list, wraps at either end, and opens a stopped saved workspace when selected. Both status rows scroll with their active item when the terminal is too narrow to show every tab or workspace. The plugin does not change the prefix. Commands without a tmux-atelier equivalent, including the native chooser on `w`, retain their normal tmux behavior.
 
 Tab and split commands read their target from tmux session options. Sessions that existed before the plugin was loaded keep native tmux behavior until they are attached again and adopted.
 

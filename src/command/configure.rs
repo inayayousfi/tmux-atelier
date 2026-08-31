@@ -29,12 +29,12 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
     let separator = option("@atelier_tab_separator").replace('#', "##");
     let title = option("@atelier_terminal_title");
     let tabs = format!(
-        "{separator}#{{W:#[range=window|#{{window_index}} {tab_style}] #I #W #[norange default]{separator},#[range=window|#{{window_index}} {active_style}] #I #W #[norange default]{separator}}}#[range=user|new-tab {add_style}] + #[default,norange]"
+        "{separator}#{{W:#[range=window|#{{window_index}} {tab_style}] #I #W #[norange default]{separator},#[list=focus range=window|#{{window_index}} {active_style}] #I #W #[norange default]{separator}#[list=on]}}#[range=user|new-tab {add_style}] + #[default,norange]"
     );
     let status = if option("@atelier_status_sides") == "on" {
         format!("#[align=left range=left #{{E:status-left-style}}]#[push-default]#{{T;=/#{{status-left-length}}:status-left}}#[pop-default]#[norange default]#[list=on align=#{{status-justify}}]{tabs}#[nolist align=right range=right #{{E:status-right-style}}]#[push-default]#{{T;=/#{{status-right-length}}:status-right}}#[pop-default]#[norange default]")
     } else {
-        format!("#[align=left]{tabs}")
+        format!("#[list=on align=left]{tabs}#[nolist]")
     };
     let executable = quote_sh(&cli.to_string_lossy());
     let internal = |command: &str| format!("{executable} internal {command}");
@@ -224,6 +224,18 @@ fn replace_native_bindings(app: &App, cli: &str, executable: &str) -> Result<()>
             || owned && action.contains("request-rename")
         {
             Some("internal request-rename \"#{session_name}\" \"#{client_name}\"")
+        } else if action == "next-window" || owned && action.contains("navigate-tab next") {
+            Some("internal navigate-tab next \"#{session_name}\"")
+        } else if action == "previous-window" || owned && action.contains("navigate-tab previous") {
+            Some("internal navigate-tab previous \"#{session_name}\"")
+        } else if action == "switch-client -n"
+            || owned && action.contains("navigate-workspace next")
+        {
+            Some("internal navigate-workspace next \"#{session_name}\" \"#{client_name}\"")
+        } else if action == "switch-client -p"
+            || owned && action.contains("navigate-workspace previous")
+        {
+            Some("internal navigate-workspace previous \"#{session_name}\" \"#{client_name}\"")
         } else {
             None
         };

@@ -71,6 +71,12 @@ pub(crate) enum Orientation {
     Horizontal,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum Direction {
+    Next,
+    Previous,
+}
+
 impl Orientation {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -109,6 +115,15 @@ pub(crate) enum InternalCommand {
         name: String,
     },
     RefreshStatus,
+    NavigateTab {
+        direction: Direction,
+        session: String,
+    },
+    NavigateWorkspace {
+        direction: Direction,
+        session: String,
+        client: Option<String>,
+    },
     StatusClick {
         token: String,
         client: Option<String>,

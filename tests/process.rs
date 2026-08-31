@@ -276,15 +276,54 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     let status = env.tmux_text(["show-options", "-gqv", "@atelier_tabs_format"]);
     assert!(status.contains("::"));
     assert!(status.contains("range=window"));
+    assert!(status.contains("list=focus"));
+    assert!(status.contains("::#[list=on]"));
     let keys = env.tmux_text(["list-keys", "-T", "prefix"]);
     assert!(keys.contains("user-binding"));
     assert!(keys.contains("another window action"));
     assert!(keys.contains(" window \\\"#{session_name}\\\""), "{keys}");
+    assert!(keys.contains("navigate-tab next"), "{keys}");
+    assert!(keys.contains("navigate-tab previous"), "{keys}");
+    assert!(keys.contains("navigate-workspace next"), "{keys}");
+    assert!(keys.contains("navigate-workspace previous"), "{keys}");
+    let workspace_status =
+        env.tmux_text(["show-options", "-qv", "-t", "=native:", "status-format[1]"]);
+    assert!(workspace_status.contains("list=focus"));
+    assert!(workspace_status.contains("│#[list=on]"));
     let hooks = env.tmux_text(["show-hooks", "-g"]);
     assert!(hooks.contains("internal refresh-status"));
     assert!(hooks.contains("internal snapshot"));
     assert!(hooks.contains("internal restore-start"));
     assert!(hooks.contains("internal adopt-session"));
+}
+
+#[test]
+fn tab_navigation_selects_adjacent_windows() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("tabs");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "tabs",
+        "--detached",
+    ]);
+    env.ok(["window", "tabs"]);
+
+    assert_eq!(
+        env.tmux_text(["display-message", "-p", "-t", "=tabs:", "#{window_index}"]),
+        "1"
+    );
+    env.ok(["internal", "navigate-tab", "previous", "tabs"]);
+    assert_eq!(
+        env.tmux_text(["display-message", "-p", "-t", "=tabs:", "#{window_index}"]),
+        "0"
+    );
+    env.ok(["internal", "navigate-tab", "next", "tabs"]);
+    assert_eq!(
+        env.tmux_text(["display-message", "-p", "-t", "=tabs:", "#{window_index}"]),
+        "1"
+    );
 }
 
 #[test]
