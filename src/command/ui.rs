@@ -232,7 +232,15 @@ fn show_new_popup(app: &App, client: Option<&str>) -> Result<()> {
     process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
-pub(super) fn status_menu(app: &App, token: &str, client: Option<&str>) -> Result<()> {
+pub(super) fn status_menu(
+    app: &App,
+    token: &str,
+    client: Option<&str>,
+    window: Option<&str>,
+) -> Result<()> {
+    if token == "window" {
+        return tab_menu(app, window.unwrap_or_default(), client);
+    }
     let name = range_name(app, token);
     app.debug(&format!(
         "status-menu token={token} resolved={name} requested_client={}",
@@ -243,6 +251,37 @@ pub(super) fn status_menu(app: &App, token: &str, client: Option<&str>) -> Resul
     } else {
         menu(app, &name, client)
     }
+}
+
+fn tab_menu(app: &App, window: &str, client: Option<&str>) -> Result<()> {
+    tabs::validate_window(window)?;
+    let command = format!(
+        "{} internal popup-tab-menu {}",
+        quote_sh(&app.cli_path()?),
+        quote_sh(window)
+    );
+    let mut owned = vec!["display-popup".to_owned()];
+    if let Some(client) = client.filter(|value| !value.is_empty()) {
+        owned.extend([
+            "-c".into(),
+            client.into(),
+            "-e".into(),
+            format!("TMUX_ATELIER_CLIENT={client}"),
+        ]);
+    }
+    app.debug(&format!(
+        "tab-menu opening window={window} target_client={}",
+        client.unwrap_or_default()
+    ))?;
+    owned.extend([
+        "-E".into(),
+        "-w".into(),
+        "45%".into(),
+        "-h".into(),
+        "30%".into(),
+        command,
+    ]);
+    process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 pub(super) fn menu(app: &App, name: &str, client: Option<&str>) -> Result<()> {

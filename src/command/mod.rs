@@ -102,9 +102,11 @@ impl App {
                 client,
                 session,
             } => ui::status_click(self, &token, client.as_deref(), session.as_deref()),
-            InternalCommand::StatusMenu { token, client } => {
-                ui::status_menu(self, &token, client.as_deref())
-            }
+            InternalCommand::StatusMenu {
+                token,
+                client,
+                window,
+            } => ui::status_menu(self, &token, client.as_deref(), window.as_deref()),
             InternalCommand::Menu { name, client } => ui::menu(self, &name, client.as_deref()),
             InternalCommand::RequestClose { name, client } => {
                 lifecycle::request_close(self, &name, client.as_deref())

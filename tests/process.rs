@@ -288,6 +288,10 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     assert!(keys.contains("navigate-workspace previous"), "{keys}");
     assert!(keys.contains("prefix N"), "{keys}");
     assert!(keys.contains("internal popup-new"), "{keys}");
+    let mouse_keys = env.tmux_text(["list-keys", "-T", "root"]);
+    assert!(mouse_keys.contains("MouseDown3Status"), "{mouse_keys}");
+    assert!(mouse_keys.contains("internal status-menu"), "{mouse_keys}");
+    assert!(mouse_keys.contains("#{window_id}"), "{mouse_keys}");
     let workspace_status =
         env.tmux_text(["show-options", "-qv", "-t", "=native:", "status-format[1]"]);
     assert!(workspace_status.contains("list=focus"));
@@ -335,6 +339,66 @@ fn tab_navigation_selects_adjacent_windows() {
         env.tmux_text(["display-message", "-p", "-t", "=tabs:", "#{window_index}"]),
         "1"
     );
+}
+
+#[test]
+fn tab_menu_actions_rename_and_delete_windows() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("tab-actions");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "tab-actions",
+        "--detached",
+    ]);
+    env.ok(["window", "tab-actions"]);
+    let window = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=tab-actions:1",
+        "#{window_id}",
+    ]);
+
+    let rename = env.scripted("input\trenamed tab\n");
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_INTERACTION_FILE", rename)
+        .args(["internal", "popup-tab-rename", &window])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        env.tmux_text(["display-message", "-p", "-t", &window, "#{window_name}"]),
+        "renamed tab"
+    );
+
+    let reject = env.scripted("confirm\tfalse\n");
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_INTERACTION_FILE", reject)
+        .args(["internal", "confirm-tab-close", &window])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(env
+        .tmux(["display-message", "-p", "-t", &window])
+        .status
+        .success());
+
+    let accept = env.scripted("confirm\ttrue\n");
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_INTERACTION_FILE", accept)
+        .args(["internal", "confirm-tab-close", &window])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!env
+        .tmux_text(["list-windows", "-t", "=tab-actions", "-F", "#{window_id}"])
+        .lines()
+        .any(|id| id == window));
 }
 
 #[test]

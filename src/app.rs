@@ -132,6 +132,7 @@ pub(crate) enum InternalCommand {
     StatusMenu {
         token: String,
         client: Option<String>,
+        window: Option<String>,
     },
     Menu {
         #[arg(allow_hyphen_values = true)]

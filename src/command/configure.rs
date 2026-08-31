@@ -77,26 +77,10 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
         ],
     )?;
     let menu = format!(
-        "run-shell -b \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\"\"",
+        "run-shell -b \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{window_id}}\\\"\"",
         internal("status-menu")
     );
-    let tab_menu = format!(
-        "display-popup -t = -e 'TMUX_ATELIER_CLIENT=#{{client_name}}' -E -w '45%' -h '30%' \"exec {} \\\"#{{window_id}}\\\"\"",
-        internal("popup-tab-menu")
-    );
-    process::tmux(
-        app,
-        &[
-            "bind-key",
-            "-n",
-            "MouseDown3Status",
-            "if-shell",
-            "-F",
-            "#{m:a*,#{mouse_status_range}}",
-            &menu,
-            &tab_menu,
-        ],
-    )?;
+    process::tmux(app, &["bind-key", "-n", "MouseDown3Status", &menu])?;
 
     replace_native_bindings(app, &cli.to_string_lossy(), &executable)?;
     configure_new_workspace_binding(app, &cli.to_string_lossy(), &executable)?;
