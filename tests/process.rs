@@ -432,6 +432,20 @@ fn tab_menu_actions_rename_and_delete_windows() {
 }
 
 #[test]
+fn terminal_confirmation_is_written_to_stderr() {
+    let env = TestEnv::new();
+
+    let output = env.with_input(["internal", "confirm-close", "workspace"], "n\n");
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "Stop workspace workspace? [Y/n] "
+    );
+}
+
+#[test]
 fn scripted_wizard_edits_and_renames_workspace() {
     let env = TestEnv::new();
     let first = env.root.path().join("first");
@@ -1245,6 +1259,29 @@ fn declining_replacement_starts_fresh_without_changing_the_live_workspace() {
 }
 
 #[test]
+fn canceling_restoration_keeps_the_snapshot_pending() {
+    let env = mismatched_restore_env();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+    let snapshot = fs::read(env.state.join("restore.snapshot")).unwrap();
+
+    let output = env.with_input(["internal", "popup-restore"], "");
+
+    assert!(output.status.success());
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "1"
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_handled"]),
+        "0"
+    );
+    assert_eq!(
+        fs::read(env.state.join("restore.snapshot")).unwrap(),
+        snapshot
+    );
+}
+
+#[test]
 fn always_mode_waits_for_confirmation_before_replacing_a_live_workspace() {
     let env = mismatched_restore_env();
     env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
@@ -1302,7 +1339,7 @@ fn confirmed_workspace_is_rejected_if_its_topology_changes() {
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
-    let mut output = child.stdout.take().unwrap();
+    let mut output = child.stderr.take().unwrap();
     let mut byte = [0];
     while output.read_exact(&mut byte).is_ok() && byte[0] != b'?' {}
     input.write_all(b"y\n").unwrap();

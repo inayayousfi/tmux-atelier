@@ -1,9 +1,10 @@
 use std::fmt;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use inquire::error::InquireError;
 use inquire::ui::{Attributes, RenderConfig};
-use inquire::{Confirm, Select, Text};
+use inquire::{Select, Text};
 
 use crate::Result;
 
@@ -54,7 +55,7 @@ impl Interaction for TerminalInteraction {
         Ok(cancelled(
             Select::new(prompt, choices)
                 .with_page_size(select_page_size())
-                .with_render_config(select_render_config())
+                .with_render_config(terminal_render_config())
                 .prompt_skippable(),
         )?
         .map(|selected| selected.index))
@@ -69,7 +70,8 @@ impl Interaction for TerminalInteraction {
                 Ok(Some(line.trim_end_matches(['\r', '\n']).to_owned()))
             };
         }
-        let mut input = Text::new(prompt);
+        let prompt = format!("{prompt}:");
+        let mut input = Text::new(&prompt).with_render_config(terminal_render_config());
         if let Some(initial) = initial {
             input = input.with_initial_value(initial);
         }
@@ -77,7 +79,103 @@ impl Interaction for TerminalInteraction {
     }
 
     fn confirm(&self, prompt: &str) -> Result<Option<bool>> {
-        cancelled(Confirm::new(prompt).with_default(false).prompt_skippable())
+        terminal_confirm(prompt)
+    }
+}
+
+pub fn terminal_confirm(prompt: &str) -> Result<Option<bool>> {
+    eprint!("{prompt} [Y/n] ");
+    io::stderr().flush()?;
+    if !io::stdin().is_terminal() {
+        let mut line = String::new();
+        return if io::stdin().read_line(&mut line)? == 0 {
+            Ok(None)
+        } else {
+            parse_confirmation(&line)
+        };
+    }
+
+    let raw_mode = RawMode::enter()?;
+    let answer = read_confirmation_key();
+    let cleanup = raw_mode.leave();
+    eprintln!();
+    cleanup?;
+    answer
+}
+
+struct RawMode {
+    active: bool,
+}
+
+impl RawMode {
+    fn enter() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self { active: true })
+    }
+
+    fn leave(mut self) -> io::Result<()> {
+        let result = crossterm::terminal::disable_raw_mode();
+        if result.is_ok() {
+            self.active = false;
+        }
+        result
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ConfirmationAction {
+    Answer(bool),
+    Cancel,
+    Interrupt,
+    Ignore,
+}
+
+fn read_confirmation_key() -> Result<Option<bool>> {
+    loop {
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match confirmation_action(key) {
+            ConfirmationAction::Answer(answer) => return Ok(Some(answer)),
+            ConfirmationAction::Cancel => return Ok(None),
+            ConfirmationAction::Interrupt => {
+                return Err(io::Error::from(io::ErrorKind::Interrupted).into());
+            }
+            ConfirmationAction::Ignore => {}
+        }
+    }
+}
+
+fn confirmation_action(key: KeyEvent) -> ConfirmationAction {
+    let plain_or_shifted = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+    match key.code {
+        KeyCode::Char('y' | 'Y') if plain_or_shifted => ConfirmationAction::Answer(true),
+        KeyCode::Char('n' | 'N') if plain_or_shifted => ConfirmationAction::Answer(false),
+        KeyCode::Enter if key.modifiers.is_empty() => ConfirmationAction::Answer(true),
+        KeyCode::Esc if key.modifiers.is_empty() => ConfirmationAction::Cancel,
+        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+            ConfirmationAction::Interrupt
+        }
+        _ => ConfirmationAction::Ignore,
+    }
+}
+
+fn parse_confirmation(line: &str) -> Result<Option<bool>> {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Ok(Some(true)),
+        "n" | "no" => Ok(Some(false)),
+        _ => Err(crate::err("expected y or n")),
     }
 }
 
@@ -91,8 +189,8 @@ fn page_size_for_rows(rows: u16) -> usize {
     usize::from(rows.saturating_sub(SELECT_RESERVED_ROWS).max(1))
 }
 
-fn select_render_config() -> RenderConfig<'static> {
-    let mut config = RenderConfig::default();
+fn terminal_render_config() -> RenderConfig<'static> {
+    let mut config = RenderConfig::empty();
     config.highlighted_option_prefix = config
         .highlighted_option_prefix
         .with_content("  ❯")
@@ -185,10 +283,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn select_menu_uses_the_expanded_indented_style() {
-        let config = select_render_config();
+    fn prompts_omit_colors_and_keep_the_expanded_indented_style() {
+        let config = terminal_render_config();
         assert_eq!(config.highlighted_option_prefix.content, "  ❯");
         assert_eq!(config.unhighlighted_option_prefix.content, "   ");
+        assert_eq!(config.highlighted_option_prefix.style.fg, None);
+        assert_eq!(config.highlighted_option_prefix.style.bg, None);
+        assert_eq!(config.prompt_prefix.style.fg, None);
+        assert_eq!(config.prompt_prefix.style.bg, None);
+        assert_eq!(config.text_input.fg, None);
+        assert_eq!(config.text_input.bg, None);
         assert!(
             config
                 .selected_option
@@ -198,5 +302,48 @@ mod tests {
         );
         assert_eq!(page_size_for_rows(30), 27);
         assert_eq!(page_size_for_rows(3), 1);
+    }
+
+    #[test]
+    fn confirmations_default_to_yes() {
+        assert_eq!(parse_confirmation("\n").unwrap(), Some(true));
+        assert_eq!(parse_confirmation("Y\n").unwrap(), Some(true));
+        assert_eq!(parse_confirmation("n\n").unwrap(), Some(false));
+        assert!(parse_confirmation("maybe\n").is_err());
+    }
+
+    #[test]
+    fn confirmations_accept_only_plain_answer_keys() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            confirmation_action(key(KeyCode::Char('y'), KeyModifiers::NONE)),
+            ConfirmationAction::Answer(true)
+        );
+        assert_eq!(
+            confirmation_action(key(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+            ConfirmationAction::Answer(false)
+        );
+        assert_eq!(
+            confirmation_action(key(KeyCode::Enter, KeyModifiers::NONE)),
+            ConfirmationAction::Answer(true)
+        );
+        assert_eq!(
+            confirmation_action(key(KeyCode::Esc, KeyModifiers::NONE)),
+            ConfirmationAction::Cancel
+        );
+        assert_eq!(
+            confirmation_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ConfirmationAction::Interrupt
+        );
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert_eq!(
+                confirmation_action(key(KeyCode::Char('y'), modifiers)),
+                ConfirmationAction::Ignore
+            );
+            assert_eq!(
+                confirmation_action(key(KeyCode::Char('n'), modifiers)),
+                ConfirmationAction::Ignore
+            );
+        }
     }
 }

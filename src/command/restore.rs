@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
 use super::{App, ui};
 use crate::config::quote_sh;
+use crate::interaction;
 use crate::process_state::ObservedForeground;
 use crate::{Result, err, process, snapshot, workspace};
 use workspace::Workspace;
@@ -313,13 +313,17 @@ pub(super) fn popup_restore(app: &App, client: Option<&str>) -> Result<()> {
         .unwrap_or_else(|| "prompt".into());
     let (workspaces, windows, panes) = saved.counts();
     let process_count = changes.processes.len();
-    if mode != "always"
-        && !confirm_line(&format!(
+    if mode != "always" {
+        match confirm_line(&format!(
             "Restore {workspaces} workspaces, {windows} tabs, {panes} panes, and {process_count} processes?"
-        ))?
-    {
-        println!("Starting fresh.");
-        return discard(app, client);
+        ))? {
+            Some(true) => {}
+            Some(false) => {
+                println!("Starting fresh.");
+                return discard(app, client);
+            }
+            None => return Ok(()),
+        }
     }
     if !changes.processes.is_empty() {
         println!("Processes to restart:");
@@ -349,9 +353,13 @@ pub(super) fn popup_restore(app: &App, client: Option<&str>) -> Result<()> {
                 process.pane
             );
         }
-        if !confirm_line("Replace them and stop their current processes?")? {
-            println!("Starting fresh.");
-            return discard(app, client);
+        match confirm_line("Replace them and stop their current processes?")? {
+            Some(true) => {}
+            Some(false) => {
+                println!("Starting fresh.");
+                return discard(app, client);
+            }
+            None => return Ok(()),
         }
     }
     let approved_workspaces = changes.mismatched;
@@ -516,12 +524,8 @@ fn complete_without_restore(app: &App) -> Result<()> {
     app.snapshot("", "")
 }
 
-fn confirm_line(prompt: &str) -> Result<bool> {
-    print!("{prompt} [y/N] ");
-    io::stdout().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y"))
+fn confirm_line(prompt: &str) -> Result<Option<bool>> {
+    interaction::terminal_confirm(prompt)
 }
 
 fn display_restore_popup(app: &App, client: &str) -> Result<()> {
