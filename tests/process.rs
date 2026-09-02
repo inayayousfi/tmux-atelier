@@ -1673,6 +1673,15 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let wait_for_marker = || {
+        for _ in 0..1000 {
+            if matches!(fs::read_to_string(&marker), Ok(contents) if contents == "original") {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
     env.ok([
         "new",
         &format!("local:{}", path.display()),
@@ -1694,18 +1703,24 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
         &format!("{} original", script.display()),
     ]);
     env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
-    thread::sleep(Duration::from_millis(200));
+    assert!(wait_for_marker(), "initial script did not write its marker");
     env.ok(["restart-policy", "always", &pane]);
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "original");
     fs::remove_file(&marker).unwrap();
     env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
     env.tmux_ok(["kill-session", "-t", "=script-restore"]);
     env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
     env.ok(["internal", "restore-arm"]);
-    env.ok(["internal", "restore-start"]);
-    thread::sleep(Duration::from_millis(200));
-
-    assert_eq!(fs::read_to_string(marker).unwrap(), "original");
+    let restore = env.cli(["internal", "restore-start"]);
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    assert!(
+        wait_for_marker(),
+        "restored script did not write its marker: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
 }
 
 fn mismatched_restore_env() -> TestEnv {
