@@ -17,6 +17,7 @@ pub struct Config {
     pub ssh_destinations_file: PathBuf,
     pub snapshot_lock: PathBuf,
     pub adoption_lock: PathBuf,
+    pub restore_lock: PathBuf,
 }
 
 impl Config {
@@ -41,6 +42,7 @@ impl Config {
             ssh_destinations_file: state_root.join("ssh-destinations"),
             snapshot_lock: state_root.join(".snapshot.lock"),
             adoption_lock: state_root.join(".adoption.lock"),
+            restore_lock: state_root.join(".restore.lock"),
             state_root,
         })
     }

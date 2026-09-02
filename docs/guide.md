@@ -177,7 +177,7 @@ Tab and split commands read their target from tmux session options. Sessions tha
 
 ## Session Restoration
 
-tmux-atelier continuously snapshots the topology of open managed workspaces. When a new tmux server starts, it can recreate their tabs, tab names, pane counts, exact split layouts, active tabs, and active panes. Local panes also return to their previous working directories when those directories still exist. SSH panes restart at the saved workspace root because tmux cannot reliably observe a remote shell's current directory.
+tmux-atelier continuously snapshots the topology of open managed workspaces. When a new tmux server starts, it can recreate their tabs, tab names, pane counts, exact split layouts, active tabs, and active panes. Local panes return to their previous working directories when those directories still exist and fall back to the workspace root after a saved directory is deleted. SSH panes restart at the saved workspace root because tmux cannot reliably observe a remote shell's current directory.
 
 Choose the startup policy before loading the plugin:
 
@@ -188,15 +188,60 @@ run-shell ~/.config/tmux/tmux-atelier/tmux-atelier.tmux
 
 The accepted values are:
 
-- `prompt` asks whether to restore everything or start fresh. This is the default.
-- `always` restores all saved workspace topologies automatically.
+- `prompt` asks whether to restore changed workspace topologies or start fresh. This is the default.
+- `always` restores missing workspaces automatically. It still asks before replacing a live workspace whose topology differs.
 - `never` starts fresh and replaces the previous snapshot.
 
-Choosing to start fresh removes only the topology snapshot. Saved workspace definitions remain available in the status line. Closing a workspace through tmux-atelier also removes it from the next snapshot.
+At startup, Atelier compares each saved workspace with its live tmux session. The comparison covers tab counts, indexes, explicit names, automatic renaming, pane counts, split layouts, active tabs and panes, and local working directories. Names generated while automatic renaming is on are not stable topology and are ignored. Tmux pane IDs, layout checksums, and whether the workspace is currently selected are not topology differences. Deleted workspace definitions and live workspaces absent from the snapshot are ignored.
+
+The prompt is skipped when every restorable workspace matches. Missing workspaces are recreated. A mismatched live workspace is staged under a temporary session name first, then replaced only after explicit confirmation; the warning lists every session whose current shells will stop. Atelier rechecks the exact user-owned topology immediately before replacement, so a pane, path, explicit name, active selection, or layout change after the prompt cancels the operation. Declining the warning cancels the complete restoration and starts fresh from the current tmux state.
+
+Before staging a replacement, Atelier stores its transaction generation plus original, temporary, and backup names on the original tmux session. A server-wide phase records one decision for the complete generation. Restore execution is serialized, and a new generation cannot overwrite an unfinished one. If restoration is interrupted before commit, the next startup restores every marked original. After commit, cleanup only deletes remaining backups and never rolls a replacement back; the committed phase remains authoritative until restore-control options are normalized. Temporary and newly created sessions receive the generation in the same tmux command queue that creates them, so cleanup never deletes an unrelated session that claimed the same candidate name. Foreground commands are not started in temporary sessions.
+
+While a restoration decision is pending, workspace and tab actions provided by Atelier are blocked so a status-bar click cannot create a one-tab workspace ahead of restoration. Native tmux commands remain available for recovery.
+
+Choosing to start fresh discards the previous topology and snapshots the current live state. Saved workspace definitions remain available in the status line. Closing a workspace through tmux-atelier also removes it from the next snapshot.
 
 The snapshot is stored with private permissions at `${XDG_STATE_HOME:-$HOME/.local/state}/tmux-atelier/restore.snapshot`. It is parsed strictly as data and is never sourced as shell code.
 
-Restoration starts new shells. It does not restore running processes, shell history, command output, unsaved editor state, or commands that were running before the tmux server stopped. Use a process-specific persistence mechanism or a plugin such as `tmux-resurrect` when that deeper restoration is required.
+### Foreground Processes
+
+On Linux, Atelier polls local panes and can restart an approved foreground command with its complete UTF-8 argument list and working directory. Empty arguments are preserved. A command containing a non-UTF-8 argument cannot be captured in the current snapshot format. Environment variables are never read or saved. Shell assignments such as `TOKEN=value command` therefore disappear, while a value passed as a command-line argument remains part of the private snapshot.
+
+Polling defaults to every five seconds, and an automatically captured process must have run for at least five seconds. Set either option before loading the plugin:
+
+```tmux
+set-option -g @atelier_restart_interval 5
+set-option -g @atelier_restart_min_runtime 5
+```
+
+Set `@atelier_restart_interval` to `off` to disable process capture and restoration. Polling rewrites the snapshot only when pane state changes. macOS and remote panes currently restore topology without foreground processes.
+
+Automatic capture excludes a process when any executable in its foreground ancestry matches this default basename denylist:
+
+```text
+awk bash basename cat chmod chown cmake cp curl cut date dd diff dirname du
+echo env false fd find fish fzf git go grep head install kill less ln ls
+make man mkdir mv ninja node npm pacman pnpm printf pwd python python3
+readlink realpath rg rm rmdir rsync ruby scp sed sh sleep sort ssh stat
+tail tar tee test tmux touch tr true uname uniq wc wget xargs zsh
+```
+
+Replace `@atelier_restart_denylist` with a whitespace-separated list to customize it. A pane can override automatic behavior:
+
+```sh
+tmux-atelier restart-policy always
+tmux-atelier restart-policy never %12
+tmux-atelier restart-policy auto %12
+```
+
+The tab menu exposes the same `auto`, `always`, and `never` choices for its active pane. `always` bypasses the denylist and minimum runtime. `never` removes the saved process recipe. Pipelines and other foreground groups whose original shell syntax cannot be reconstructed are not captured.
+
+Before changing any pane, restoration compares every saved argv with its live foreground process and prepares the complete restart plan. An idle pane restarts the saved command in place. Replacing a different live process requires explicit confirmation, including under `@atelier_restore always`. Prompts show the program and pane but never its arguments.
+
+Bash, zsh, and fish commands start through the captured shell and login mode so current profile files apply. The private launcher uses the saved executable path for lookup and assigns the captured `argv[0]` separately, including an empty or custom value. Immediately before changing any pane, Atelier rechecks every planned live pane ID, foreground process, and workspace topology; one stale value at that point skips the complete process plan. It also rechecks each live pane immediately before its own restart. Tmux has no atomic compare-and-restart operation, so a later pane can still change after its final check while an earlier pane is restarting; that later launch remains best effort rather than all-or-none. Tmux accepting the pane restart counts as a successful launch; Atelier does not impose a startup deadline or claim that the command remains running. A rejected launch leaves restoration complete, reports a warning, and does not block launches in other panes. When a started command finishes, the pane returns to its captured shell. Program output and errors remain visible; Atelier also prints a termination signal or nonzero exit status. An unsupported shell is an intentional successful fallback: it reports a warning and returns to the captured shell without starting the saved command.
+
+Process restart does not restore process memory, shell history, command output from before shutdown, unsaved editor state, pipelines, redirections, aliases, or functions. Applications such as Neovim and OpenCode still need their own persistence when internal state matters.
 
 ## Native Recovery
 

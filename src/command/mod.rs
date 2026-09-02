@@ -1,5 +1,6 @@
 mod configure;
 mod lifecycle;
+mod restart;
 mod restore;
 mod tabs;
 mod ui;
@@ -46,6 +47,11 @@ impl App {
     }
 
     pub(crate) fn dispatch(&self, command: Command) -> Result<()> {
+        if self.restore_pending() && !allowed_during_restore(&command) {
+            return Err(err(
+                "workspace restoration is pending; finish the restoration prompt first",
+            ));
+        }
         match command {
             Command::New {
                 target,
@@ -72,6 +78,7 @@ impl App {
             Command::Edit { name, target } => lifecycle::edit(self, &name, &target, None),
             Command::Close { name } => lifecycle::close(self, &name),
             Command::Delete { name } => lifecycle::delete(self, &name),
+            Command::RestartPolicy { policy, pane } => restart::set(self, policy, pane.as_deref()),
             Command::Internal { command } => self.dispatch_internal(command),
         }
     }
@@ -131,8 +138,23 @@ impl App {
             InternalCommand::RestoreArm => restore::arm(self),
             InternalCommand::RestoreStart { client } => restore::start(self, client.as_deref()),
             InternalCommand::RestoreAttached => restore::attached(self),
-            InternalCommand::Restore { client } => restore::run(self, client.as_deref()),
+            InternalCommand::Restore { client } => restore::run(
+                self,
+                client.as_deref(),
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            ),
             InternalCommand::RestoreDiscard => restore::discard(self, None),
+            InternalCommand::PollProcesses { generation } => restart::poll(self, &generation),
+            InternalCommand::PaneRun {
+                shell,
+                login,
+                executable,
+                argv,
+            } => restart::pane_run(&shell, login, &executable, &argv),
+            InternalCommand::ProcessExec { executable, argv } => {
+                restart::process_exec(&executable, &argv)
+            }
             InternalCommand::AdoptSession { session, client } => {
                 restore::adopt(self, &session, client.as_deref())
             }
@@ -162,6 +184,11 @@ impl App {
         process::tmux(self, &["set-option", "-gq", option, value])
     }
 
+    fn restore_pending(&self) -> bool {
+        process::tmux_quiet(self, &["show-options", "-gqv", "@atelier_restore_pending"]).as_deref()
+            == Some("1")
+    }
+
     fn cli_path(&self) -> Result<String> {
         process::tmux_quiet(self, &["show-options", "-gqv", "@atelier_cli"])
             .filter(|value| !value.is_empty())
@@ -179,6 +206,29 @@ impl App {
         fs::set_permissions(&self.debug_log, fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
+}
+
+fn allowed_during_restore(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Internal {
+            command: InternalCommand::Configure { .. }
+                | InternalCommand::PopupRestore { .. }
+                | InternalCommand::RefreshStatus
+                | InternalCommand::Snapshot
+                | InternalCommand::RestoreArm
+                | InternalCommand::RestoreStart { .. }
+                | InternalCommand::RestoreAttached
+                | InternalCommand::Restore { .. }
+                | InternalCommand::RestoreDiscard
+                | InternalCommand::PollProcesses { .. }
+                | InternalCommand::PaneRun { .. }
+                | InternalCommand::ProcessExec { .. }
+                | InternalCommand::AdoptSession { .. }
+                | InternalCommand::DebugPath
+                | InternalCommand::DebugClear
+        }
+    )
 }
 
 fn shell_option(app: &App, session: &str, destination: &str) -> String {

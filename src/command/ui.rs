@@ -1,8 +1,9 @@
 use std::env;
 
-use super::{App, lifecycle, tabs};
+use super::{App, lifecycle, restart, tabs};
 use crate::app::Direction;
 use crate::config::quote_sh;
+use crate::process_state::RestartPolicy;
 use crate::{Result, process, workspace};
 
 pub(super) fn refresh_status(app: &App) -> Result<()> {
@@ -391,15 +392,31 @@ pub(super) fn popup_tab_menu(app: &App, window: &str) -> Result<()> {
     app.debug(&format!(
         "tab-menu started window={window} name={name} inherited_client={client}"
     ))?;
-    let choices = ["Rename tab", "Close tab"];
+    let choices = ["Rename tab", "Restart after restore", "Close tab"];
     let Some(index) = choose_action(app, &name, &choices)? else {
         return Ok(());
     };
     match choices[index] {
         "Rename tab" => defer_request(app, "request-tab-rename", window, &client),
+        "Restart after restore" => popup_restart_policy(app, window),
         "Close tab" => defer_request(app, "request-tab-close", window, &client),
         _ => Ok(()),
     }
+}
+
+fn popup_restart_policy(app: &App, window: &str) -> Result<()> {
+    let pane = process::tmux_output(app, &["display-message", "-p", "-t", window, "#{pane_id}"])?;
+    let choices = ["Auto", "Always", "Never"];
+    let Some(index) = choose_action(app, "Restart active pane", &choices)? else {
+        return Ok(());
+    };
+    let policy = match choices[index] {
+        "Auto" => RestartPolicy::Auto,
+        "Always" => RestartPolicy::Always,
+        "Never" => RestartPolicy::Never,
+        _ => unreachable!(),
+    };
+    restart::set(app, policy, Some(&pane))
 }
 
 fn defer_request(app: &App, request: &str, target: &str, client: &str) -> Result<()> {

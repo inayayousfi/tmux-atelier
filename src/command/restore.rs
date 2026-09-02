@@ -1,10 +1,12 @@
+use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::thread;
 use std::time::Duration;
 
 use super::{App, ui};
 use crate::config::quote_sh;
+use crate::process_state::ObservedForeground;
 use crate::{Result, err, process, snapshot, workspace};
 use workspace::Workspace;
 
@@ -154,7 +156,24 @@ pub(super) fn discard(app: &App, client: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn run(app: &App, client: Option<&str>) -> Result<()> {
+pub(super) fn run(
+    app: &App,
+    client: Option<&str>,
+    approved_replacements: &HashMap<String, snapshot::WorkspaceTopology>,
+    approved_processes: &HashMap<String, ObservedForeground>,
+) -> Result<()> {
+    snapshot::lock(app, &app.restore_lock, || {
+        snapshot::recover_replacements(app)?;
+        run_locked(app, client, approved_replacements, approved_processes)
+    })
+}
+
+fn run_locked(
+    app: &App,
+    client: Option<&str>,
+    approved_replacements: &HashMap<String, snapshot::WorkspaceTopology>,
+    approved_processes: &HashMap<String, ObservedForeground>,
+) -> Result<()> {
     if !app.restore_file.is_file() {
         return Ok(());
     }
@@ -181,79 +200,188 @@ pub(super) fn run(app: &App, client: Option<&str>) -> Result<()> {
     ))?;
     app.set_global("@atelier_restore_pending", "1")?;
     app.set_global("@atelier_restore_handled", "0")?;
-    if snapshot::restore(app, &saved).is_err() {
+    let process_plan = match snapshot::plan_processes(app, &saved, approved_processes) {
+        Ok(plan) => plan,
+        Err(error) => {
+            app.set_global("@atelier_restore_started", "0")?;
+            return Err(error);
+        }
+    };
+    let restored = snapshot::restore(app, &saved, approved_replacements);
+    match restored {
+        Ok(()) => {}
+        Err(error) => {
+            app.set_global("@atelier_restore_pending", "1")?;
+            app.set_global("@atelier_restore_handled", "0")?;
+            app.set_global("@atelier_restore_started", "0")?;
+            app.debug(&format!(
+                "restore failed; retry enabled reason=topology: {error}"
+            ))?;
+            return Err(err(format!(
+                "workspace restoration failed: topology: {error}"
+            )));
+        }
+    }
+    let precommit = (|| -> Result<()> {
+        for workspace in saved
+            .workspaces
+            .iter()
+            .filter(|workspace| app.workspaces.join(&workspace.name).is_file())
+        {
+            if !snapshot::workspace_matches(app, workspace)? {
+                return Err(err("restored topology did not match snapshot"));
+            }
+        }
+        if let Some(client) = client
+            .filter(|_| !saved.active.is_empty() && workspace::session_exists(app, &saved.active))
+        {
+            process::tmux(
+                app,
+                &[
+                    "switch-client",
+                    "-c",
+                    client,
+                    "-t",
+                    &format!("={}", saved.active),
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = precommit {
+        snapshot::recover_replacements(app)?;
         app.set_global("@atelier_restore_pending", "1")?;
         app.set_global("@atelier_restore_handled", "0")?;
         app.set_global("@atelier_restore_started", "0")?;
-        app.debug("restore failed; created sessions rolled back and retry enabled")?;
-        return Err(err("workspace restoration failed"));
+        app.debug(&format!("restore failed; retry enabled reason={error}"))?;
+        return Err(err(format!("workspace restoration failed: {error}")));
     }
-    app.set_global("@atelier_restore_pending", "0")?;
-    app.set_global("@atelier_restore_handled", "1")?;
-    app.set_global("@atelier_restore_started", "1")?;
-    app.snapshot("", "")?;
-    ui::refresh_status(app)?;
+    let mut warnings = match snapshot::commit_replacements(app) {
+        Ok(warnings) => warnings,
+        Err(error) => {
+            snapshot::recover_replacements(app)?;
+            app.set_global("@atelier_restore_pending", "1")?;
+            app.set_global("@atelier_restore_handled", "0")?;
+            app.set_global("@atelier_restore_started", "0")?;
+            return Err(error);
+        }
+    };
+    warnings.extend(snapshot::apply_processes(app, process_plan));
     if !bootstrap.is_empty()
         && bootstrap != saved.active
         && workspace::session_exists(app, &bootstrap)
         && workspace::session_option(app, &bootstrap, "@atelier_managed") != "1"
+        && let Err(error) = process::tmux(app, &["kill-session", "-t", &format!("={bootstrap}")])
     {
-        process::tmux(app, &["kill-session", "-t", &format!("={bootstrap}")])?;
+        warnings.push(format!("could not remove bootstrap session: {error}"));
     }
-    if let Some(client) =
-        client.filter(|_| !saved.active.is_empty() && workspace::session_exists(app, &saved.active))
-    {
-        process::tmux(
-            app,
-            &[
-                "switch-client",
-                "-c",
-                client,
-                "-t",
-                &format!("={}", saved.active),
-            ],
-        )?;
+    let mut state_normalized = true;
+    for (option, value) in [
+        ("@atelier_restore_pending", "0"),
+        ("@atelier_restore_handled", "1"),
+        ("@atelier_restore_started", "1"),
+    ] {
+        if let Err(error) = app.set_global(option, value) {
+            state_normalized = false;
+            warnings.push(format!("could not set {option}: {error}"));
+        }
     }
-    app.debug(&format!(
+    warnings.extend(snapshot::finish_replacements(app, state_normalized));
+    if let Err(error) = ui::refresh_status(app) {
+        warnings.push(format!("could not refresh status: {error}"));
+    }
+    for warning in warnings {
+        eprintln!("tmux-atelier: {warning}");
+        if let Some(client) = client.filter(|client| !client.is_empty()) {
+            let _ = process::tmux(app, &["display-message", "-c", client, &warning]);
+        }
+        let _ = app.debug(&format!("restore warning={warning}"));
+    }
+    let _ = app.debug(&format!(
         "restore completed client={} active={}",
         client.unwrap_or_default(),
         saved.active
-    ))
+    ));
+    Ok(())
 }
 
 pub(super) fn popup_restore(app: &App, client: Option<&str>) -> Result<()> {
     let saved = snapshot::read(app).map_err(|_| err("invalid restore snapshot"))?;
+    let changes = restore_changes(app, &saved)?;
+    let mode = process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_restore"])
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "prompt".into());
     let (workspaces, windows, panes) = saved.counts();
-    print!("Restore {workspaces} workspaces, {windows} tabs, and {panes} panes? [y/N] ");
-    io::stdout().flush()?;
-    let mut byte = [0];
-    let accepted = io::stdin().read_exact(&mut byte).is_ok() && matches!(byte[0], b'y' | b'Y');
-    println!();
-    if accepted {
-        run(app, client)
-    } else {
+    let process_count = changes.processes.len();
+    if mode != "always"
+        && !confirm_line(&format!(
+            "Restore {workspaces} workspaces, {windows} tabs, {panes} panes, and {process_count} processes?"
+        ))?
+    {
         println!("Starting fresh.");
-        discard(app, client)
+        return discard(app, client);
     }
+    if !changes.processes.is_empty() {
+        println!("Processes to restart:");
+        for process in &changes.processes {
+            println!(
+                "  {} in {}:{}.{}",
+                process.program, process.workspace, process.window, process.pane
+            );
+        }
+    }
+    let destructive_processes: Vec<_> = changes
+        .processes
+        .iter()
+        .filter(|process| process.destructive())
+        .collect();
+    if !changes.mismatched.is_empty() || !destructive_processes.is_empty() {
+        println!("The following live state will be replaced:");
+        for name in changes.mismatched.keys() {
+            println!("  workspace {name}");
+        }
+        for process in destructive_processes {
+            println!(
+                "  {} in {}:{}.{}",
+                process.current.as_deref().unwrap_or("process"),
+                process.workspace,
+                process.window,
+                process.pane
+            );
+        }
+        if !confirm_line("Replace them and stop their current processes?")? {
+            println!("Starting fresh.");
+            return discard(app, client);
+        }
+    }
+    let approved_workspaces = changes.mismatched;
+    let approved_processes = changes
+        .processes
+        .into_iter()
+        .filter(|process| process.destructive())
+        .map(|process| (process.key, process.observed))
+        .collect();
+    run(app, client, &approved_workspaces, &approved_processes)
 }
 
 pub(super) fn arm(app: &App) -> Result<()> {
+    snapshot::lock(app, &app.restore_lock, || {
+        snapshot::recover_replacements(app)
+    })?;
     let handled = process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_restore_handled"])
         .unwrap_or_default();
     if !handled.is_empty() {
         app.debug(&format!("restore arm skipped handled={handled}"))?;
         return Ok(());
     }
-    for session in workspace::session_names(app) {
-        if workspace::session_option(app, &session, "@atelier_managed") == "1" {
-            app.set_global("@atelier_restore_handled", "1")?;
-            app.set_global("@atelier_restore_pending", "0")?;
-            app.set_global("@atelier_restore_started", "1")?;
-            app.snapshot("", "")?;
+    if app.restore_file.is_file() {
+        if snapshot::read(app)
+            .and_then(|saved| restore_changes(app, &saved))
+            .is_ok_and(|changes| changes.is_empty())
+        {
+            complete_without_restore(app)?;
             return Ok(());
         }
-    }
-    if app.restore_file.is_file() {
         app.set_global("@atelier_restore_handled", "0")?;
         app.set_global("@atelier_restore_pending", "1")?;
         app.set_global("@atelier_restore_started", "0")?;
@@ -266,6 +394,9 @@ pub(super) fn arm(app: &App) -> Result<()> {
 }
 
 pub(super) fn start(app: &App, client: Option<&str>) -> Result<()> {
+    snapshot::lock(app, &app.restore_lock, || {
+        snapshot::recover_replacements(app)
+    })?;
     let handled = process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_restore_handled"])
         .unwrap_or_default();
     if handled != "0" {
@@ -282,9 +413,6 @@ pub(super) fn start(app: &App, client: Option<&str>) -> Result<()> {
             "invalid @atelier_restore value: expected always, never, or prompt",
         ));
     }
-    if mode == "prompt" && client.unwrap_or_default().is_empty() {
-        return Ok(());
-    }
     process::tmux(app, &["wait-for", "-L", "atelier-restore-start"])?;
     let handled = process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_restore_handled"])
         .unwrap_or_default();
@@ -294,38 +422,32 @@ pub(super) fn start(app: &App, client: Option<&str>) -> Result<()> {
         process::tmux(app, &["wait-for", "-U", "atelier-restore-start"])?;
         return Ok(());
     }
+    let changes = snapshot::read(app).and_then(|saved| restore_changes(app, &saved));
+    if changes.as_ref().is_ok_and(|changes| changes.is_empty()) {
+        let result = (|| {
+            app.debug("restore skipped; live workspace topology matches snapshot")?;
+            complete_without_restore(app)
+        })();
+        let unlock = process::tmux(app, &["wait-for", "-U", "atelier-restore-start"]);
+        return result.and(unlock);
+    }
+    let needs_confirmation = mode == "prompt"
+        || (mode == "always" && changes.as_ref().is_ok_and(RestoreChanges::destructive));
+    if needs_confirmation && client.unwrap_or_default().is_empty() {
+        process::tmux(app, &["wait-for", "-U", "atelier-restore-start"])?;
+        return Ok(());
+    }
     if app.set_global("@atelier_restore_started", "1").is_err() {
         let _ = process::tmux(app, &["wait-for", "-U", "atelier-restore-start"]);
         return Err(err("could not start restore"));
     }
     process::tmux(app, &["wait-for", "-U", "atelier-restore-start"])?;
     match mode.as_str() {
-        "always" => run(app, client),
+        "always" if !needs_confirmation => run(app, client, &HashMap::new(), &HashMap::new()),
         "never" => discard(app, client),
-        "prompt" => {
+        "always" | "prompt" => {
             let client = client.unwrap();
-            name_bootstrap(app, client)?;
-            let command = format!(
-                "{} internal popup-restore {}",
-                quote_sh(&app.cli_path()?),
-                quote_sh(client)
-            );
-            if process::tmux(
-                app,
-                &[
-                    "display-popup",
-                    "-c",
-                    client,
-                    "-E",
-                    "-w",
-                    "55%",
-                    "-h",
-                    "20%",
-                    &command,
-                ],
-            )
-            .is_err()
-            {
+            if display_restore_popup(app, client).is_err() {
                 app.set_global("@atelier_restore_started", "0")?;
                 return Err(err("could not open restore prompt"));
             }
@@ -339,6 +461,90 @@ pub(super) fn start(app: &App, client: Option<&str>) -> Result<()> {
         }
         _ => unreachable!(),
     }
+}
+
+struct RestoreChanges {
+    missing: Vec<String>,
+    mismatched: HashMap<String, snapshot::WorkspaceTopology>,
+    processes: Vec<snapshot::ProcessChange>,
+}
+
+impl RestoreChanges {
+    fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.mismatched.is_empty() && self.processes.is_empty()
+    }
+
+    fn destructive(&self) -> bool {
+        !self.mismatched.is_empty()
+            || self
+                .processes
+                .iter()
+                .any(snapshot::ProcessChange::destructive)
+    }
+}
+
+fn restore_changes(app: &App, saved: &snapshot::Snapshot) -> Result<RestoreChanges> {
+    let mut changes = RestoreChanges {
+        missing: Vec::new(),
+        mismatched: HashMap::new(),
+        processes: Vec::new(),
+    };
+    for saved in &saved.workspaces {
+        if !app.workspaces.join(&saved.name).is_file() {
+            continue;
+        }
+        match snapshot::current_workspace(app, &saved.name)? {
+            None => changes.missing.push(saved.name.clone()),
+            Some(current) => {
+                let definition = workspace::read(app, &saved.name)?;
+                let fallback =
+                    (definition.destination == "local").then_some(definition.path.as_str());
+                if !snapshot::topology_matches_snapshot_at(&current, saved, fallback) {
+                    changes.mismatched.insert(saved.name.clone(), current);
+                }
+            }
+        }
+    }
+    changes.processes = snapshot::process_changes(app, saved)?;
+    Ok(changes)
+}
+
+fn complete_without_restore(app: &App) -> Result<()> {
+    app.set_global("@atelier_restore_pending", "0")?;
+    app.set_global("@atelier_restore_handled", "1")?;
+    app.set_global("@atelier_restore_started", "1")?;
+    app.snapshot("", "")
+}
+
+fn confirm_line(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y"))
+}
+
+fn display_restore_popup(app: &App, client: &str) -> Result<()> {
+    name_bootstrap(app, client)?;
+    let command = format!(
+        "{} internal popup-restore {}",
+        quote_sh(&app.cli_path()?),
+        quote_sh(client)
+    );
+    process::tmux(
+        app,
+        &[
+            "display-popup",
+            "-c",
+            client,
+            "-E",
+            "-w",
+            "55%",
+            "-h",
+            "40%",
+            &command,
+        ],
+    )
 }
 
 fn name_bootstrap(app: &App, client: &str) -> Result<()> {

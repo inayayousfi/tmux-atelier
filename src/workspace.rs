@@ -399,6 +399,69 @@ pub fn create_session(config: &Config, workspace: &Workspace, initial_path: &str
     Ok(())
 }
 
+pub fn create_restore_session(
+    config: &Config,
+    workspace: &Workspace,
+    initial_path: &str,
+    generation: &str,
+) -> Result<()> {
+    let mut arguments = if workspace.destination == "local" {
+        if !Path::new(&workspace.path).is_dir() {
+            return Err(err(format!(
+                "local path is not a directory: {}",
+                workspace.path
+            )));
+        }
+        let initial = if Path::new(initial_path).is_dir() {
+            initial_path
+        } else {
+            &workspace.path
+        };
+        vec![
+            "new-session".to_owned(),
+            "-d".into(),
+            "-s".into(),
+            workspace.name.clone(),
+            "-c".into(),
+            initial.into(),
+        ]
+    } else {
+        vec![
+            "new-session".to_owned(),
+            "-d".into(),
+            "-s".into(),
+            workspace.name.clone(),
+            process::remote_shell_command(
+                config,
+                &workspace.destination,
+                &workspace.path,
+                &workspace.shell,
+            )?,
+        ]
+    };
+    arguments.extend([
+        ";".into(),
+        "set-option".into(),
+        "-q".into(),
+        "-t".into(),
+        format!("={}:", workspace.name),
+        "@atelier_restore_owner".into(),
+        generation.into(),
+    ]);
+    process::tmux(
+        config,
+        &arguments.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    if let Err(error) = mark_session(config, workspace) {
+        let _ = process::tmux(
+            config,
+            &["kill-session", "-t", &format!("={}", workspace.name)],
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn mark_session(config: &Config, workspace: &Workspace) -> Result<()> {
     let target = format!("={}:", workspace.name);
     for (option, value) in [
@@ -427,6 +490,7 @@ mod tests {
             ssh_destinations_file: root.join("ssh-destinations"),
             snapshot_lock: root.join(".snapshot.lock"),
             adoption_lock: root.join(".adoption.lock"),
+            restore_lock: root.join(".restore.lock"),
         }
     }
 

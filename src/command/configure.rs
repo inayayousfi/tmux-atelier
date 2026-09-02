@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use super::{App, restore, ui};
+use super::{App, restart, restore, ui};
 use crate::config::quote_sh;
 use crate::{Result, process};
 
@@ -15,6 +15,12 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
         ("@atelier_separator", "│"),
         ("@atelier_tab_separator", "│"),
         ("@atelier_restore", "prompt"),
+        ("@atelier_restart_interval", "5"),
+        ("@atelier_restart_min_runtime", "5"),
+        (
+            "@atelier_restart_denylist",
+            crate::process_state::DEFAULT_DENYLIST,
+        ),
         ("@atelier_status_sides", "off"),
         ("@atelier_new_workspace_key", "N"),
         ("@atelier_terminal_title", "#W - #S@#{@atelier_destination}"),
@@ -158,7 +164,8 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
             &internal("restore-attached"),
         ],
     )?;
-    ui::refresh_status(app)
+    ui::refresh_status(app)?;
+    restart::arm(app)
 }
 
 fn set_default(app: &App, option: &str, value: &str) -> Result<()> {

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::Result;
 use crate::command::App;
+use crate::process_state::RestartPolicy;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +58,10 @@ pub(crate) enum Command {
     Delete {
         #[arg(allow_hyphen_values = true)]
         name: String,
+    },
+    RestartPolicy {
+        policy: RestartPolicy,
+        pane: Option<String>,
     },
     #[command(hide = true)]
     Internal {
@@ -186,6 +191,25 @@ pub(crate) enum InternalCommand {
         client: Option<String>,
     },
     RestoreDiscard,
+    PollProcesses {
+        generation: String,
+    },
+    PaneRun {
+        #[arg(long)]
+        shell: String,
+        #[arg(long)]
+        login: bool,
+        #[arg(long)]
+        executable: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
+    ProcessExec {
+        #[arg(long)]
+        executable: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
     AdoptSession {
         #[arg(allow_hyphen_values = true)]
         session: String,

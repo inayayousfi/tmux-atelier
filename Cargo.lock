@@ -493,6 +493,7 @@ dependencies = [
  "crossterm",
  "glob",
  "inquire",
+ "libc",
  "tempfile",
 ]
 

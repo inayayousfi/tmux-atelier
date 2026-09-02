@@ -1,10 +1,14 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use tempfile::TempDir;
+use tmux_atelier::snapshot::Snapshot;
 
 struct TestEnv {
     root: TempDir,
@@ -132,6 +136,28 @@ impl TestEnv {
         let path = self.root.path().join("interaction");
         fs::write(&path, responses).unwrap();
         path
+    }
+
+    fn with_input<I, S>(&self, args: I, input: &str) -> Output
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = self
+            .command(&self.cli)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
 }
 
@@ -614,6 +640,7 @@ fn snapshot_restores_windows_and_panes() {
     env.ok(["window", "restored"]);
     let pane = env.tmux_text(["display-message", "-p", "-t", "=restored:1", "#{pane_id}"]);
     env.ok(["split", "horizontal", &pane]);
+    env.tmux_ok(["move-window", "-s", "=restored:1", "-t", "=restored:3"]);
     env.ok(["internal", "snapshot"]);
     assert!(env.state.join("restore.snapshot").is_file());
 
@@ -621,7 +648,12 @@ fn snapshot_restores_windows_and_panes() {
     env.tmux_ok(["kill-session", "-t", "=restored"]);
     env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
     env.ok(["internal", "restore-arm"]);
-    env.ok(["internal", "restore-start"]);
+    let restore = env.cli(["internal", "restore-start"]);
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
     assert!(
         env.tmux(["has-session", "-t", "=restored"])
             .status
@@ -634,9 +666,1068 @@ fn snapshot_restores_windows_and_panes() {
         2
     );
     assert_eq!(
-        env.tmux_text(["list-panes", "-t", "=restored:1", "-F", "#{pane_id}"])
+        env.tmux_text(["list-windows", "-t", "=restored", "-F", "#{window_index}"]),
+        "0\n3"
+    );
+    assert_eq!(
+        env.tmux_text(["list-panes", "-t", "=restored:3", "-F", "#{pane_id}"])
             .lines()
             .count(),
         2
     );
+}
+
+#[test]
+fn restore_prompt_is_skipped_when_saved_sessions_already_exist() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("existing restore project");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "existing",
+        "--detached",
+    ]);
+    env.ok(["internal", "snapshot"]);
+
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_handled", "0"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_pending", "1"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_started", "0"]);
+    env.ok(["internal", "restore-start"]);
+
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_handled"]),
+        "1",
+        "{}",
+        fs::read_to_string(env.state.join("debug.log")).unwrap_or_default()
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "0"
+    );
+}
+
+#[test]
+fn interrupted_replacements_restore_the_original_session() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("recovery project");
+    fs::create_dir(&path).unwrap();
+    env.tmux_ok([
+        "new-session",
+        "-d",
+        "-s",
+        "recover",
+        "-c",
+        path.to_str().unwrap(),
+    ]);
+    let original_pane =
+        env.tmux_text(["display-message", "-p", "-t", "=recover:0.0", "#{pane_id}"]);
+
+    for phase in 0..4 {
+        env.tmux_ok([
+            "set-option",
+            "-gq",
+            "@atelier_restore_transaction_phase",
+            "test|prepared",
+        ]);
+        env.tmux_ok([
+            "set-option",
+            "-q",
+            "-t",
+            "=recover:",
+            "@atelier_restore_transaction",
+            "2|test|recover|restore-stage|restore-backup",
+        ]);
+        if phase > 0 {
+            env.tmux_ok(["new-session", "-d", "-s", "restore-stage"]);
+            env.tmux_ok([
+                "set-option",
+                "-q",
+                "-t",
+                "=restore-stage:",
+                "@atelier_restore_owner",
+                "test",
+            ]);
+        }
+        if phase > 1 {
+            env.tmux_ok(["rename-session", "-t", "=recover", "restore-backup"]);
+        }
+        if phase > 2 {
+            env.tmux_ok(["rename-session", "-t", "=restore-stage", "recover"]);
+        }
+        env.ok(["internal", "restore-arm"]);
+        assert_eq!(
+            env.tmux_text(["display-message", "-p", "-t", "=recover:0.0", "#{pane_id}",]),
+            original_pane
+        );
+        assert!(
+            !env.tmux(["has-session", "-t", "=restore-stage"])
+                .status
+                .success()
+        );
+        assert!(
+            !env.tmux(["has-session", "-t", "=restore-backup"])
+                .status
+                .success()
+        );
+        assert_eq!(
+            env.tmux_text([
+                "show-options",
+                "-qv",
+                "-t",
+                "=recover:",
+                "@atelier_restore_transaction",
+            ]),
+            ""
+        );
+    }
+
+    env.tmux_ok(["new-session", "-d", "-s", "native-stage"]);
+    env.tmux_ok([
+        "set-option",
+        "-gq",
+        "@atelier_restore_transaction_phase",
+        "test|prepared",
+    ]);
+    env.tmux_ok([
+        "set-option",
+        "-q",
+        "-t",
+        "=recover:",
+        "@atelier_restore_transaction",
+        "2|test|recover|native-stage|restore-backup",
+    ]);
+    env.ok(["internal", "restore-arm"]);
+    assert!(
+        env.tmux(["has-session", "-t", "=native-stage"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn committed_replacement_cleanup_never_rolls_back_remaining_backups() {
+    let env = TestEnv::new();
+    for suffix in ["one", "two"] {
+        env.tmux_ok(["new-session", "-d", "-s", &format!("original-{suffix}")]);
+        env.tmux_ok(["new-session", "-d", "-s", &format!("staged-{suffix}")]);
+        env.tmux_ok([
+            "set-option",
+            "-q",
+            "-t",
+            &format!("=original-{suffix}:"),
+            "@atelier_restore_transaction",
+            &format!("2|test|original-{suffix}|staged-{suffix}|backup-{suffix}"),
+        ]);
+        env.tmux_ok([
+            "set-option",
+            "-q",
+            "-t",
+            &format!("=staged-{suffix}:"),
+            "@atelier_restore_owner",
+            "test",
+        ]);
+        env.tmux_ok([
+            "rename-session",
+            "-t",
+            &format!("=original-{suffix}"),
+            &format!("backup-{suffix}"),
+        ]);
+        env.tmux_ok([
+            "rename-session",
+            "-t",
+            &format!("=staged-{suffix}"),
+            &format!("original-{suffix}"),
+        ]);
+    }
+    env.tmux_ok([
+        "set-option",
+        "-gq",
+        "@atelier_restore_transaction_phase",
+        "test|committed",
+    ]);
+    env.tmux_ok(["kill-session", "-t", "=backup-one"]);
+
+    env.ok(["internal", "restore-arm"]);
+
+    for suffix in ["one", "two"] {
+        assert!(
+            env.tmux(["has-session", "-t", &format!("=original-{suffix}")])
+                .status
+                .success()
+        );
+        assert!(
+            !env.tmux(["has-session", "-t", &format!("=backup-{suffix}")])
+                .status
+                .success()
+        );
+    }
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "0"
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_handled"]),
+        "1"
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_transaction_phase",]),
+        ""
+    );
+}
+
+#[test]
+fn deleted_pane_directory_restores_at_workspace_root() {
+    let env = TestEnv::new();
+    let root = env.root.path().join("path fallback project");
+    let nested = root.join("removed");
+    fs::create_dir_all(&nested).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", root.display()),
+        "path-fallback",
+        "--detached",
+    ]);
+    env.tmux_ok([
+        "send-keys",
+        "-l",
+        "-t",
+        "=path-fallback:0.0",
+        &format!("cd {}", nested.display()),
+    ]);
+    env.tmux_ok(["send-keys", "-t", "=path-fallback:0.0", "Enter"]);
+    thread::sleep(Duration::from_millis(100));
+    env.ok(["internal", "snapshot"]);
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=path-fallback"]);
+    fs::remove_dir(&nested).unwrap();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
+    env.ok(["internal", "restore-arm"]);
+    env.ok(["internal", "restore-start"]);
+
+    assert_eq!(
+        env.tmux_text([
+            "display-message",
+            "-p",
+            "-t",
+            "=path-fallback:0.0",
+            "#{pane_current_path}",
+        ]),
+        root.to_string_lossy()
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "0"
+    );
+}
+
+#[test]
+fn deleted_saved_directory_matches_an_existing_root_pane() {
+    let env = TestEnv::new();
+    let root = env.root.path().join("existing path fallback project");
+    let nested = root.join("removed");
+    fs::create_dir_all(&nested).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", root.display()),
+        "existing-path-fallback",
+        "--detached",
+    ]);
+    env.tmux_ok([
+        "send-keys",
+        "-l",
+        "-t",
+        "=existing-path-fallback:0.0",
+        &format!("cd {}", nested.display()),
+    ]);
+    env.tmux_ok(["send-keys", "-t", "=existing-path-fallback:0.0", "Enter"]);
+    thread::sleep(Duration::from_millis(100));
+    env.ok(["internal", "snapshot"]);
+    let pane = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=existing-path-fallback:0.0",
+        "#{pane_id}",
+    ]);
+    env.tmux_ok([
+        "send-keys",
+        "-l",
+        "-t",
+        &pane,
+        &format!("cd {}", root.display()),
+    ]);
+    env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
+    thread::sleep(Duration::from_millis(100));
+    fs::remove_dir(&nested).unwrap();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_handled", "0"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_pending", "1"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_started", "0"]);
+    env.ok(["internal", "restore-start"]);
+
+    assert_eq!(
+        env.tmux_text([
+            "display-message",
+            "-p",
+            "-t",
+            "=existing-path-fallback:0.0",
+            "#{pane_id}",
+        ]),
+        pane
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_handled"]),
+        "1"
+    );
+}
+
+#[test]
+fn internal_process_launcher_preserves_custom_and_empty_argv0() {
+    let env = TestEnv::new();
+    for (name, argv0) in [("custom", "custom-name"), ("empty", "")] {
+        let output = env.root.path().join(name);
+        let script = format!("printf %s \"$0\" > {}", output.display());
+        let result = env.cli([
+            "internal",
+            "process-exec",
+            "--executable",
+            "/bin/sh",
+            "--",
+            argv0,
+            "-c",
+            &script,
+        ]);
+        assert!(result.status.success());
+        assert_eq!(fs::read_to_string(output).unwrap(), argv0);
+    }
+}
+
+#[test]
+fn unsupported_shell_skips_recipe_without_failing_restore() {
+    let env = TestEnv::new();
+    fs::write(env.root.path().join(".zshrc"), "").unwrap();
+    let path = env.root.path().join("unsupported shell project");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "unsupported-shell",
+        "--detached",
+    ]);
+    let pane = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=unsupported-shell:0.0",
+        "#{pane_id}",
+    ]);
+    env.ok(["restart-policy", "always", &pane]);
+    env.tmux_ok(["send-keys", "-l", "-t", &pane, "sleep 30"]);
+    env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
+    thread::sleep(Duration::from_millis(200));
+    env.ok(["internal", "snapshot"]);
+    let snapshot_path = env.state.join("restore.snapshot");
+    let mut saved = Snapshot::decode(&fs::read(&snapshot_path).unwrap()).unwrap();
+    saved.workspaces[0].windows[0].panes[0]
+        .shell
+        .as_mut()
+        .unwrap()
+        .executable = "/bin/sh".into();
+    fs::write(&snapshot_path, saved.encode()).unwrap();
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=unsupported-shell"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
+    env.ok(["internal", "restore-arm"]);
+    let restored = env.cli(["internal", "restore-start"]);
+    assert!(restored.status.success());
+    assert!(String::from_utf8_lossy(&restored.stderr).contains("unsupported"));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        env.tmux_text([
+            "display-message",
+            "-p",
+            "-t",
+            "=unsupported-shell:0.0",
+            "#{pane_current_command}",
+        ]),
+        "sh"
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "0"
+    );
+}
+
+#[test]
+fn legacy_two_option_shell_state_is_still_captured() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("legacy shell project");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "legacy-shell",
+        "--detached",
+    ]);
+    let pane = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=legacy-shell:0.0",
+        "#{pane_id}",
+    ]);
+    env.tmux_ok([
+        "set-option",
+        "-pq",
+        "-t",
+        &pane,
+        "@atelier_restart_shell",
+        "/bin/bash",
+    ]);
+    env.tmux_ok([
+        "set-option",
+        "-pq",
+        "-t",
+        &pane,
+        "@atelier_restart_shell_login",
+        "1",
+    ]);
+    env.ok(["internal", "snapshot"]);
+    let saved = Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    assert_eq!(
+        saved.workspaces[0].windows[0].panes[0]
+            .shell
+            .as_ref()
+            .unwrap(),
+        &tmux_atelier::process_state::SavedShell {
+            executable: "/bin/bash".into(),
+            login: true,
+        }
+    );
+}
+
+#[test]
+fn atelier_actions_are_blocked_while_restoration_is_pending() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("pending project");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "pending",
+        "--detached",
+    ]);
+    env.ok(["internal", "snapshot"]);
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=pending"]);
+    env.ok(["internal", "restore-arm"]);
+
+    let output = env.cli(["open", "pending", "--detached"]);
+    assert!(!output.status.success());
+    assert!(!env.tmux(["has-session", "-t", "=pending"]).status.success());
+}
+
+#[test]
+fn confirmed_restoration_replaces_a_mismatched_workspace() {
+    let env = mismatched_restore_env();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+
+    let output = env.with_input(["internal", "popup-restore"], "y\ny\n");
+    assert!(output.status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(
+        env.tmux_text(["list-panes", "-t", "=mismatch:1", "-F", "#{pane_id}"])
+            .lines()
+            .count(),
+        2
+    );
+    assert!(
+        !env.tmux_text(["list-sessions", "-F", "#{session_name}"])
+            .lines()
+            .any(|name| name.starts_with("atelier-restore-"))
+    );
+    assert_eq!(
+        env.tmux_text([
+            "show-options",
+            "-qv",
+            "-t",
+            "=mismatch:",
+            "@atelier_restore_transaction",
+        ]),
+        ""
+    );
+    assert_eq!(
+        env.tmux_text([
+            "show-options",
+            "-qv",
+            "-t",
+            "=mismatch:",
+            "@atelier_restore_owner",
+        ]),
+        ""
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_transaction_phase",]),
+        ""
+    );
+}
+
+#[test]
+fn confirmed_restoration_commits_multiple_replacements_together() {
+    let env = TestEnv::new();
+    for name in ["replace-one", "replace-two"] {
+        let path = env.root.path().join(name);
+        fs::create_dir(&path).unwrap();
+        env.ok([
+            "new",
+            &format!("local:{}", path.display()),
+            name,
+            "--detached",
+        ]);
+        env.tmux_ok(["new-window", "-d", "-t", &format!("={name}:")]);
+    }
+    env.ok(["internal", "snapshot"]);
+    let saved = fs::read(env.state.join("restore.snapshot")).unwrap();
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    for name in ["replace-one", "replace-two"] {
+        env.tmux_ok(["kill-session", "-t", &format!("={name}")]);
+        env.ok(["open", name, "--detached"]);
+    }
+    fs::write(env.state.join("restore.snapshot"), saved).unwrap();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+    env.ok(["internal", "restore-arm"]);
+
+    let restored = env.with_input(["internal", "popup-restore"], "y\ny\n");
+    assert!(restored.status.success());
+    for name in ["replace-one", "replace-two"] {
+        assert_eq!(
+            env.tmux_text([
+                "list-windows",
+                "-t",
+                &format!("={name}"),
+                "-F",
+                "#{window_id}"
+            ])
+            .lines()
+            .count(),
+            2
+        );
+    }
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_transaction_phase",]),
+        ""
+    );
+}
+
+#[test]
+fn declining_replacement_starts_fresh_without_changing_the_live_workspace() {
+    let env = mismatched_restore_env();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+
+    let output = env.with_input(["internal", "popup-restore"], "y\nn\n");
+    assert!(output.status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "0"
+    );
+}
+
+#[test]
+fn always_mode_waits_for_confirmation_before_replacing_a_live_workspace() {
+    let env = mismatched_restore_env();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
+
+    env.ok(["internal", "restore-start"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "1"
+    );
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        1
+    );
+
+    let output = env.with_input(["internal", "popup-restore"], "y\n");
+    assert!(output.status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn direct_internal_restore_cannot_replace_an_unconfirmed_workspace() {
+    let env = mismatched_restore_env();
+
+    let output = env.cli(["internal", "restore"]);
+    assert!(!output.status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_restore_pending"]),
+        "1"
+    );
+}
+
+#[test]
+fn confirmed_workspace_is_rejected_if_its_topology_changes() {
+    let env = mismatched_restore_env();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+    let mut child = env
+        .command(&env.cli)
+        .args(["internal", "popup-restore"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let mut byte = [0];
+    while output.read_exact(&mut byte).is_ok() && byte[0] != b'?' {}
+    input.write_all(b"y\n").unwrap();
+    input.flush().unwrap();
+    while output.read_exact(&mut byte).is_ok() && byte[0] != b'?' {}
+
+    env.tmux_ok(["new-window", "-d", "-t", "=mismatch:"]);
+    let window_count_before = env
+        .tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+        .lines()
+        .count();
+    input.write_all(b"y\n").unwrap();
+    drop(input);
+    let status = child.wait().unwrap();
+
+    assert!(!status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        window_count_before
+    );
+}
+
+#[test]
+fn process_change_during_topology_staging_skips_every_process_launch() {
+    let env = TestEnv::new();
+    fs::write(env.root.path().join(".zshrc"), "").unwrap();
+    let slow_path = env.root.path().join("slow staging project");
+    let process_path = env.root.path().join("stale process project");
+    fs::create_dir(&slow_path).unwrap();
+    fs::create_dir(&process_path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", slow_path.display()),
+        "slow-stage",
+        "--detached",
+    ]);
+    for _ in 0..15 {
+        env.tmux_ok(["new-window", "-d", "-t", "=slow-stage:"]);
+    }
+    env.ok([
+        "new",
+        &format!("local:{}", process_path.display()),
+        "stale-process",
+        "--detached",
+    ]);
+    let process_pane = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=stale-process:0.0",
+        "#{pane_id}",
+    ]);
+    env.tmux_ok(["send-keys", "-l", "-t", &process_pane, "sleep 30"]);
+    env.tmux_ok(["send-keys", "-t", &process_pane, "Enter"]);
+    thread::sleep(Duration::from_millis(200));
+    env.ok(["restart-policy", "always", &process_pane]);
+    let saved = fs::read(env.state.join("restore.snapshot")).unwrap();
+
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=slow-stage"]);
+    env.ok(["open", "slow-stage", "--detached"]);
+    fs::write(env.state.join("restore.snapshot"), saved).unwrap();
+    env.tmux_ok(["send-keys", "-t", &process_pane, "C-c"]);
+    thread::sleep(Duration::from_millis(100));
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+    env.ok(["internal", "restore-arm"]);
+
+    let mut child = env
+        .command(&env.cli)
+        .args(["internal", "popup-restore"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\ny\n").unwrap();
+    let mut staging_started = false;
+    for _ in 0..200 {
+        if env
+            .tmux_text(["list-sessions", "-F", "#{session_name}"])
+            .lines()
+            .any(|name| name.starts_with("atelier-restore-"))
+        {
+            staging_started = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(staging_started);
+    env.tmux_ok(["send-keys", "-l", "-t", &process_pane, "sleep 25"]);
+    env.tmux_ok(["send-keys", "-t", &process_pane, "Enter"]);
+    let restored = child.wait_with_output().unwrap();
+    assert!(restored.status.success());
+    assert!(String::from_utf8_lossy(&restored.stderr).contains("skipped process restoration"));
+    thread::sleep(Duration::from_millis(100));
+    env.ok(["internal", "snapshot"]);
+    let current = Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    let pane = &current
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.name == "stale-process")
+        .unwrap()
+        .windows[0]
+        .panes[0];
+    assert_eq!(pane.process.as_ref().unwrap().argv, ["sleep", "25"]);
+}
+
+#[test]
+fn topology_change_during_later_staging_preserves_every_original() {
+    let env = TestEnv::new();
+    let first_path = env.root.path().join("first staged project");
+    let second_path = env.root.path().join("second staged project");
+    fs::create_dir(&first_path).unwrap();
+    fs::create_dir(&second_path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", first_path.display()),
+        "first-stage",
+        "--detached",
+    ]);
+    env.tmux_ok(["new-window", "-d", "-t", "=first-stage:"]);
+    env.ok([
+        "new",
+        &format!("local:{}", second_path.display()),
+        "second-stage",
+        "--detached",
+    ]);
+    for _ in 0..15 {
+        env.tmux_ok(["new-window", "-d", "-t", "=second-stage:"]);
+    }
+    env.ok(["internal", "snapshot"]);
+    let saved = fs::read(env.state.join("restore.snapshot")).unwrap();
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    for name in ["first-stage", "second-stage"] {
+        env.tmux_ok(["kill-session", "-t", &format!("={name}")]);
+        env.ok(["open", name, "--detached"]);
+    }
+    fs::write(env.state.join("restore.snapshot"), saved).unwrap();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+    env.ok(["internal", "restore-arm"]);
+
+    let mut child = env
+        .command(&env.cli)
+        .args(["internal", "popup-restore"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\ny\n").unwrap();
+    let mut staging_started = false;
+    for _ in 0..300 {
+        let staging = env
+            .tmux_text(["list-sessions", "-F", "#{session_name}"])
+            .lines()
+            .filter(|name| name.starts_with("atelier-restore-"))
+            .count();
+        if staging >= 1 {
+            staging_started = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(staging_started);
+    env.tmux_ok(["new-window", "-d", "-t", "=first-stage:"]);
+    let output = child.wait_with_output().unwrap();
+
+    assert!(!output.status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=first-stage", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        2
+    );
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=second-stage", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        !env.tmux_text(["list-sessions", "-F", "#{session_name}"])
+            .lines()
+            .any(|name| name.starts_with("atelier-restore-"))
+    );
+}
+
+#[test]
+fn failed_staging_preserves_the_mismatched_live_workspace() {
+    let env = mismatched_restore_env();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "prompt"]);
+    let snapshot_path = env.state.join("restore.snapshot");
+    let mut saved = Snapshot::decode(&fs::read(&snapshot_path).unwrap()).unwrap();
+    saved.workspaces[0].windows[0].layout = "invalid-layout".into();
+    fs::write(snapshot_path, saved.encode()).unwrap();
+
+    let output = env.with_input(["internal", "popup-restore"], "y\ny\n");
+    assert!(!output.status.success());
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=mismatch", "-F", "#{window_id}"])
+            .lines()
+            .count(),
+        1
+    );
+    assert!(
+        !env.tmux_text(["list-sessions", "-F", "#{session_name}"])
+            .lines()
+            .any(|name| name.starts_with("atelier-restore-"))
+    );
+}
+
+#[test]
+fn snapshot_restores_foreground_process_and_returns_to_shell() {
+    let env = TestEnv::new();
+    fs::write(env.root.path().join(".zshrc"), "").unwrap();
+    let path = env.root.path().join("process restore project");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "process-restore",
+        "--detached",
+    ]);
+    let pane = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=process-restore:0",
+        "#{pane_id}",
+    ]);
+    let shell = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        &pane,
+        "#{pane_current_command}",
+    ]);
+    thread::sleep(Duration::from_millis(200));
+    env.tmux_ok(["send-keys", "-l", "-t", &pane, "sleep 30"]);
+    env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
+    thread::sleep(Duration::from_millis(200));
+    let current = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        &pane,
+        "#{pane_current_command}",
+    ]);
+    let output = env.tmux_text(["capture-pane", "-p", "-t", &pane]);
+    assert_eq!(current, "sleep", "pane output:\n{output}");
+    env.ok(["internal", "snapshot"]);
+    let automatic =
+        Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    assert!(
+        automatic.workspaces[0].windows[0].panes[0]
+            .process
+            .is_none()
+    );
+
+    env.ok(["restart-policy", "always", &pane]);
+
+    let saved = Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    let state = &saved.workspaces[0].windows[0].panes[0];
+    assert!(state.process.is_some(), "captured pane state: {state:?}");
+    assert_eq!(state.process.as_ref().unwrap().argv, ["sleep", "30"]);
+
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=process-restore"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
+    env.ok(["internal", "restore-arm"]);
+    let restore = env.cli(["internal", "restore-start"]);
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        env.tmux_text([
+            "display-message",
+            "-p",
+            "-t",
+            "=process-restore:0.0",
+            "#{pane_current_command}",
+        ]),
+        "sleep"
+    );
+    assert!(
+        env.tmux_text([
+            "show-options",
+            "-pqv",
+            "-t",
+            "=process-restore:0.0",
+            "@atelier_restart_shell_state",
+        ])
+        .starts_with("1|")
+    );
+    assert_eq!(
+        env.tmux_text([
+            "show-options",
+            "-pqv",
+            "-t",
+            "=process-restore:0.0",
+            "@atelier_restart_shell",
+        ]),
+        ""
+    );
+    env.ok(["internal", "snapshot"]);
+    let restored =
+        Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    assert_eq!(
+        restored.workspaces[0].windows[0].panes[0]
+            .shell
+            .as_ref()
+            .unwrap(),
+        state.shell.as_ref().unwrap()
+    );
+
+    env.tmux_ok(["send-keys", "-t", "=process-restore:0.0", "C-c"]);
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        env.tmux_text([
+            "display-message",
+            "-p",
+            "-t",
+            "=process-restore:0.0",
+            "#{pane_current_command}",
+        ]),
+        shell
+    );
+
+    env.tmux_ok([
+        "send-keys",
+        "-l",
+        "-t",
+        "=process-restore:0.0",
+        "sleep 30 | cat",
+    ]);
+    env.tmux_ok(["send-keys", "-t", "=process-restore:0.0", "Enter"]);
+    thread::sleep(Duration::from_millis(200));
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_pending", "1"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore_handled", "0"]);
+    let unconfirmed = env.cli(["internal", "restore"]);
+    assert!(!unconfirmed.status.success());
+    assert!(
+        env.tmux(["has-session", "-t", "=process-restore"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn captured_shebang_script_restarts_through_its_interpreter() {
+    let env = TestEnv::new();
+    fs::write(env.root.path().join(".zshrc"), "").unwrap();
+    let path = env.root.path().join("script restore project");
+    fs::create_dir(&path).unwrap();
+    let script = env.root.path().join("restart-script");
+    let marker = env.root.path().join("script-marker");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf %s \"$1\" > {}\nsleep 30\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "script-restore",
+        "--detached",
+    ]);
+    let pane = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=script-restore:0.0",
+        "#{pane_id}",
+    ]);
+    env.tmux_ok([
+        "send-keys",
+        "-l",
+        "-t",
+        &pane,
+        &format!("{} original", script.display()),
+    ]);
+    env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
+    thread::sleep(Duration::from_millis(200));
+    env.ok(["restart-policy", "always", &pane]);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "original");
+    fs::remove_file(&marker).unwrap();
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=script-restore"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
+    env.ok(["internal", "restore-arm"]);
+    env.ok(["internal", "restore-start"]);
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(fs::read_to_string(marker).unwrap(), "original");
+}
+
+fn mismatched_restore_env() -> TestEnv {
+    let env = TestEnv::new();
+    let path = env.root.path().join("mismatched restore project");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "mismatch",
+        "--detached",
+    ]);
+    env.ok(["window", "mismatch"]);
+    let pane = env.tmux_text(["display-message", "-p", "-t", "=mismatch:1", "#{pane_id}"]);
+    env.ok(["split", "horizontal", &pane]);
+    env.ok(["internal", "snapshot"]);
+    let saved = fs::read(env.state.join("restore.snapshot")).unwrap();
+
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    env.tmux_ok(["kill-session", "-t", "=mismatch"]);
+    env.ok(["open", "mismatch", "--detached"]);
+    fs::write(env.state.join("restore.snapshot"), saved).unwrap();
+    env.ok(["internal", "restore-arm"]);
+    env
 }
