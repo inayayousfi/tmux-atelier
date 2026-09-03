@@ -1,27 +1,56 @@
 use std::env;
 
-use super::{App, lifecycle, restart, tabs};
+use super::{App, configure, lifecycle, restart, tabs};
 use crate::app::Direction;
 use crate::config::quote_sh;
 use crate::process_state::RestartPolicy;
 use crate::{Result, process, workspace};
 
 pub(super) fn refresh_status(app: &App) -> Result<()> {
-    let status_format = process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_tabs_format"])
-        .unwrap_or_default();
-    if let Some(options) = process::tmux_quiet(app, &["show-options", "-g"]) {
-        for line in options.lines() {
-            if let Some(option) = line
-                .split_whitespace()
-                .next()
-                .filter(|option| option.starts_with("@atelier_range_"))
-            {
-                let _ = process::tmux(app, &["set-option", "-gu", option]);
-            }
-        }
-    }
+    crate::snapshot::lock(app, &app.status_lock, || refresh_status_locked(app))
+}
+
+fn refresh_status_locked(app: &App) -> Result<()> {
+    let clients = client_ids(app);
+    let status_format = configure::tabs_format(app, &clients);
+    process::tmux(
+        app,
+        &["set-option", "-gq", "@atelier_tabs_format", &status_format],
+    )?;
+    let generation =
+        process::tmux_quiet(app, &["show-options", "-gqv", "@atelier_range_generation"])
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0)
+            .wrapping_add(1);
+    process::tmux(
+        app,
+        &[
+            "set-option",
+            "-gq",
+            "@atelier_range_generation",
+            &generation.to_string(),
+        ],
+    )?;
+    let names = workspace::all_names(app)?;
+    let tokens = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let token = format!("a{generation:x}_{index:x}");
+            process::tmux(
+                app,
+                &[
+                    "set-option",
+                    "-gq",
+                    &format!("@atelier_range_{token}"),
+                    name,
+                ],
+            )?;
+            Ok(token)
+        })
+        .collect::<Result<Vec<_>>>()?;
     for session in workspace::session_names(app) {
-        let line = status_line_for(app, &session)?;
+        let line = status_line_for(app, &session, &names, &tokens, &clients)?;
         let target = format!("={session}:");
         process::tmux(
             app,
@@ -39,10 +68,34 @@ pub(super) fn refresh_status(app: &App) -> Result<()> {
             &["set-option", "-q", "-t", &target, "status-format[1]", &line],
         )?;
     }
+    if let Some(options) = process::tmux_quiet(app, &["show-options", "-g"]) {
+        let current = format!("@atelier_range_a{generation:x}_");
+        let previous = format!("@atelier_range_a{:x}_", generation.wrapping_sub(1));
+        let dragging = options
+            .lines()
+            .any(|line| line.starts_with("@atelier_drag_kind_"));
+        for line in options.lines() {
+            if let Some(option) = line.split_whitespace().next().filter(|option| {
+                option.starts_with("@atelier_range_")
+                    && *option != "@atelier_range_generation"
+                    && !dragging
+                    && !option.starts_with(&current)
+                    && !option.starts_with(&previous)
+            }) {
+                let _ = process::tmux(app, &["set-option", "-gu", option]);
+            }
+        }
+    }
     Ok(())
 }
 
-fn status_line_for(app: &App, active: &str) -> Result<String> {
+fn status_line_for(
+    app: &App,
+    active: &str,
+    names: &[String],
+    tokens: &[String],
+    clients: &[String],
+) -> Result<String> {
     let option = |name: &str, fallback: &str| {
         process::tmux_quiet(app, &["show-options", "-gqv", name])
             .filter(|value| !value.is_empty())
@@ -54,35 +107,56 @@ fn status_line_for(app: &App, active: &str) -> Result<String> {
     let add_style = option("@atelier_add_style", "bold");
     let separator = option("@atelier_separator", "│").replace('#', "##");
     let mut line = format!("#[list=on align=left]{separator}");
-    for (index, name) in workspace::all_names(app)?.into_iter().enumerate() {
-        let token = format!("a{index}");
-        process::tmux(
-            app,
-            &[
-                "set-option",
-                "-gq",
-                &format!("@atelier_range_{token}"),
-                &name,
-            ],
-        )?;
-        let label = workspace_label(app, &name).replace('#', "##");
+    for (name, token) in names.iter().zip(tokens) {
+        let label = workspace_label(app, name).replace('#', "##");
         let style = if name == active {
             &active_style
-        } else if workspace::session_exists(app, &name) {
+        } else if workspace::session_exists(app, name) {
             &live_style
         } else {
             &stopped_style
         };
         let focus = if name == active { "#[list=focus]" } else { "" };
         let unfocus = if name == active { "#[list=on]" } else { "" };
+        let overlay = drag_overlays(clients, name, token, "@atelier_workspace_active_style");
         line.push_str(&format!(
-            "{focus}#[range=user|{token},{style}] {label} #[default,norange]{separator}{unfocus}"
+            "{focus}#[range=user|{token},{style}]{overlay} {label} #[default,norange]{separator}{unfocus}"
         ));
     }
     line.push_str(&format!(
         "#[range=user|new,{add_style}] + #[default,norange]#[nolist]"
     ));
     Ok(line)
+}
+
+pub(super) fn client_ids(app: &App) -> Vec<String> {
+    let mut clients = process::tmux_quiet(app, &["list-clients", "-F", "#{client_pid}"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    clients.sort();
+    clients.dedup();
+    clients
+}
+
+pub(super) fn drag_overlays(
+    clients: &[String],
+    source_identity: &str,
+    target_identity: &str,
+    active_style: &str,
+) -> String {
+    let mut format = String::new();
+    for client in clients {
+        format.push_str(&format!(
+            "#{{?#{{&&:#{{==:#{{client_pid}},{client}}},#{{==:#{{@atelier_drag_target_{client}}},{target_identity}}}}},#[#{{E:{active_style}}}#,#{{E:@atelier_drag_target_style}}],}}"
+        ));
+        format.push_str(&format!(
+            "#{{?#{{&&:#{{==:#{{client_pid}},{client}}},#{{==:#{{@atelier_drag_source_{client}}},{source_identity}}}}},#[#{{E:@atelier_drag_source_style}}],}}"
+        ));
+    }
+    format
 }
 
 pub(super) fn navigate_workspace(
@@ -161,8 +235,19 @@ pub(super) fn status_click(
     app: &App,
     token: &str,
     client: Option<&str>,
+    client_id: &str,
     session: Option<&str>,
+    window: Option<&str>,
 ) -> Result<()> {
+    clear_drag(app, client_id, client)?;
+    if token == "window" {
+        let window = window.unwrap_or_default();
+        tabs::validate_window(window)?;
+        if let Some(client) = client.filter(|value| !value.is_empty()) {
+            return process::tmux(app, &["switch-client", "-c", client, "-t", window]);
+        }
+        return process::tmux(app, &["select-window", "-t", window]);
+    }
     if token == "new" {
         return show_new_popup(app, client);
     }
@@ -200,6 +285,302 @@ pub(super) fn status_click(
         process::tmux(app, &owned.iter().map(String::as_str).collect::<Vec<_>>())
     } else {
         lifecycle::open(app, &name, None)
+    }
+}
+
+pub(super) fn drag_start(
+    app: &App,
+    token: &str,
+    client: &str,
+    client_id: &str,
+    window: Option<&str>,
+) -> Result<()> {
+    validate_client_id(client_id)?;
+    clear_drag(app, client_id, None)?;
+    let (kind, source) = if token == "window" {
+        let window = window.unwrap_or_default();
+        tabs::validate_window(window)?;
+        ("tab", window.to_owned())
+    } else {
+        let name = range_name(app, token);
+        if name.is_empty() {
+            return Ok(());
+        }
+        workspace::validate_name(&name)?;
+        ("workspace", name)
+    };
+    process::tmux(
+        app,
+        &["set-option", "-gq", &drag_option("kind", client_id), kind],
+    )?;
+    process::tmux(
+        app,
+        &[
+            "set-option",
+            "-gq",
+            &drag_option("source", client_id),
+            &source,
+        ],
+    )?;
+    configure_drag_table(app, client_id)?;
+    refresh_status(app)?;
+    refresh_client(app, client)?;
+    if client.is_empty() {
+        Ok(())
+    } else {
+        process::tmux(
+            app,
+            &["switch-client", "-c", client, "-T", &drag_table(client_id)],
+        )
+    }
+}
+
+pub(super) fn drag_end(
+    app: &App,
+    token: &str,
+    client: &str,
+    client_id: &str,
+    window: Option<&str>,
+) -> Result<()> {
+    validate_client_id(client_id)?;
+    let kind = drag_value(app, "kind", client_id);
+    let source = drag_value(app, "source", client_id);
+    clear_drag(app, client_id, Some(client))?;
+    if kind.is_empty() || source.is_empty() {
+        return Ok(());
+    }
+    if kind == "tab" && token == "window" {
+        return tabs::reorder(app, &source, window.unwrap_or_default());
+    }
+    if kind == "workspace" && token != "window" {
+        let target = range_name(app, token);
+        if !target.is_empty() {
+            workspace::reorder(app, &source, &target)?;
+            return refresh_status(app);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn drag_update(
+    app: &App,
+    token: &str,
+    client: &str,
+    client_id: &str,
+    window: Option<&str>,
+) -> Result<()> {
+    validate_client_id(client_id)?;
+    let kind = drag_value(app, "kind", client_id);
+    if drag_value(app, "source", client_id).is_empty() {
+        return Ok(());
+    }
+    let target = if kind == "tab" && token == "window" {
+        let window = window.unwrap_or_default();
+        if window.is_empty() {
+            None
+        } else {
+            tabs::validate_window(window)?;
+            Some(window.to_owned())
+        }
+    } else if kind == "workspace" && token != "window" {
+        let name = range_name(app, token);
+        (!name.is_empty()).then_some(token.to_owned())
+    } else {
+        None
+    };
+    let current = drag_value(app, "target", client_id);
+    if target.as_deref().unwrap_or_default() != current {
+        if let Some(target) = target {
+            process::tmux(
+                app,
+                &[
+                    "set-option",
+                    "-gq",
+                    &drag_option("target", client_id),
+                    &target,
+                ],
+            )?;
+        } else {
+            process::tmux(
+                app,
+                &["set-option", "-gu", &drag_option("target", client_id)],
+            )?;
+        }
+        refresh_client(app, client)?;
+    }
+    if client.is_empty() {
+        Ok(())
+    } else {
+        process::tmux(
+            app,
+            &["switch-client", "-c", client, "-T", &drag_table(client_id)],
+        )
+    }
+}
+
+pub(super) fn drag_cancel(app: &App, client_id: &str, client: Option<&str>) -> Result<()> {
+    validate_client_id(client_id)?;
+    clear_drag(app, client_id, client)?;
+    if client.is_none_or(str::is_empty) {
+        refresh_status(app)?;
+    }
+    Ok(())
+}
+
+pub(super) fn cleanup_drags(app: &App) -> Result<()> {
+    let active: std::collections::HashSet<_> = client_ids(app).into_iter().collect();
+    if let Some(options) = process::tmux_quiet(app, &["show-options", "-g"]) {
+        let stale = options
+            .lines()
+            .filter_map(|line| {
+                line.split_whitespace()
+                    .next()?
+                    .strip_prefix("@atelier_drag_kind_")
+            })
+            .filter(|client_id| !active.contains(*client_id))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        for client_id in stale {
+            clear_drag(app, &client_id, None)?;
+        }
+    }
+    refresh_status(app)
+}
+
+fn configure_drag_table(app: &App, client_id: &str) -> Result<()> {
+    let table = drag_table(client_id);
+    process::tmux_success(app, &["unbind-key", "-a", "-T", &table]);
+    let target = drag_option("target", client_id);
+    let clear_motion =
+        format!("set-option -gu {target} ; refresh-client -S ; switch-client -T {table}");
+    let executable = quote_sh(&app.cli_path()?);
+    let update = format!(
+        "run-shell \"exec {executable} internal drag-update \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" {client_id} \\\"#{{window_id}}\\\"\""
+    );
+    process::tmux(
+        app,
+        &["bind-key", "-r", "-T", &table, "MouseDrag1Status", &update],
+    )?;
+    for key in [
+        "MouseDrag1StatusDefault",
+        "MouseDrag1StatusLeft",
+        "MouseDrag1StatusRight",
+        "MouseDrag1Pane",
+        "MouseDrag1Border",
+        "MouseDrag1ScrollbarSlider",
+        "MouseDrag1ScrollbarUp",
+        "MouseDrag1ScrollbarDown",
+    ] {
+        bind_drag_action(app, &table, key, &clear_motion)?;
+    }
+    for control in 0..=9 {
+        bind_drag_action(
+            app,
+            &table,
+            &format!("MouseDrag1Control{control}"),
+            &clear_motion,
+        )?;
+    }
+    let drop = format!(
+        "run-shell \"exec {executable} internal drag-end \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" {client_id} \\\"#{{window_id}}\\\"\""
+    );
+    process::tmux(
+        app,
+        &["bind-key", "-T", &table, "MouseDragEnd1Status", &drop],
+    )?;
+    let cancel = format!(
+        "run-shell \"exec {executable} internal drag-cancel {client_id} \\\"#{{client_name}}\\\"\""
+    );
+    for key in [
+        "MouseDragEnd1StatusDefault",
+        "MouseDragEnd1StatusLeft",
+        "MouseDragEnd1StatusRight",
+        "MouseDragEnd1Pane",
+        "MouseDragEnd1Border",
+        "MouseDragEnd1ScrollbarSlider",
+        "MouseDragEnd1ScrollbarUp",
+        "MouseDragEnd1ScrollbarDown",
+        "MouseUp1StatusDefault",
+        "MouseUp1StatusLeft",
+        "MouseUp1StatusRight",
+        "MouseUp1Pane",
+        "MouseUp1Border",
+        "MouseUp1ScrollbarSlider",
+        "MouseUp1ScrollbarUp",
+        "MouseUp1ScrollbarDown",
+    ] {
+        process::tmux(app, &["bind-key", "-T", &table, key, &cancel])?;
+    }
+    for control in 0..=9 {
+        for event in ["MouseDragEnd1Control", "MouseUp1Control"] {
+            process::tmux(
+                app,
+                &[
+                    "bind-key",
+                    "-T",
+                    &table,
+                    &format!("{event}{control}"),
+                    &cancel,
+                ],
+            )?;
+        }
+    }
+    let click = format!(
+        "run-shell \"exec {executable} internal status-click \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" {client_id} \\\"#{{session_name}}\\\" \\\"#{{window_id}}\\\"\""
+    );
+    process::tmux(app, &["bind-key", "-T", &table, "MouseUp1Status", &click])
+}
+
+fn bind_drag_action(app: &App, table: &str, key: &str, action: &str) -> Result<()> {
+    process::tmux(
+        app,
+        &[
+            "bind-key", "-r", "-T", table, key, "if-shell", "-F", "1", action,
+        ],
+    )
+}
+
+fn clear_drag(app: &App, client_id: &str, client: Option<&str>) -> Result<()> {
+    validate_client_id(client_id)?;
+    for field in ["kind", "source", "target"] {
+        process::tmux(app, &["set-option", "-gu", &drag_option(field, client_id)])?;
+    }
+    process::tmux_success(app, &["unbind-key", "-a", "-T", &drag_table(client_id)]);
+    if let Some(client) = client.filter(|value| !value.is_empty()) {
+        let _ = process::tmux(app, &["refresh-client", "-S", "-t", client]);
+    }
+    Ok(())
+}
+
+fn refresh_client(app: &App, client: &str) -> Result<()> {
+    if client.is_empty() {
+        Ok(())
+    } else {
+        process::tmux(app, &["refresh-client", "-S", "-t", client])
+    }
+}
+
+fn drag_value(app: &App, field: &str, client_id: &str) -> String {
+    process::tmux_quiet(
+        app,
+        &["show-options", "-gqv", &drag_option(field, client_id)],
+    )
+    .unwrap_or_default()
+}
+
+fn drag_option(field: &str, client_id: &str) -> String {
+    format!("@atelier_drag_{field}_{client_id}")
+}
+
+fn drag_table(client_id: &str) -> String {
+    format!("atelier-drag-{client_id}")
+}
+
+fn validate_client_id(client_id: &str) -> Result<()> {
+    if !client_id.is_empty() && client_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(crate::err(format!("invalid tmux client id: {client_id}")))
     }
 }
 
@@ -469,7 +850,7 @@ pub(super) fn popup_request(
 
 #[cfg(test)]
 mod tests {
-    use super::adjacent_name;
+    use super::{adjacent_name, drag_overlays};
     use crate::app::Direction;
 
     #[test]
@@ -489,5 +870,24 @@ mod tests {
             Some("three")
         );
         assert_eq!(adjacent_name(&[], "missing", Direction::Next), None);
+    }
+
+    #[test]
+    fn drag_overlays_are_client_specific_semantic_styles_with_source_precedence() {
+        let format = drag_overlays(
+            &["123".into(), "456".into()],
+            "workspace",
+            "a1_0",
+            "@atelier_workspace_active_style",
+        );
+        assert!(format.contains("#{==:#{client_pid},123}"));
+        assert!(format.contains("#{@atelier_drag_target_456}"));
+        assert!(format.contains("#{E:@atelier_workspace_active_style}"));
+        assert!(format.contains("#{E:@atelier_drag_target_style}"));
+        assert!(format.contains("#{E:@atelier_drag_source_style}"));
+        assert!(format.find("drag_target_123").unwrap() < format.find("drag_source_123").unwrap());
+        assert!(!format.contains("colour"));
+        assert!(!format.contains("rgb"));
+        assert!(!format.contains('#') || !format.contains("#ff"));
     }
 }

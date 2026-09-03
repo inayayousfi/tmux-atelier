@@ -332,6 +332,12 @@ pub fn workspace_for_local_path(config: &Config, wanted: &str) -> Result<Option<
 }
 
 pub fn all_names(config: &Config) -> Result<Vec<String>> {
+    crate::snapshot::lock(config, &config.workspace_order_lock, || {
+        ordered_names(config)
+    })
+}
+
+fn creation_order(config: &Config) -> Result<Vec<String>> {
     let definitions = definition_names(config)?;
     let definition_set: HashSet<_> = definitions.iter().cloned().collect();
     let mut ordered: Vec<(f64, String)> = definitions
@@ -358,6 +364,91 @@ pub fn all_names(config: &Config) -> Result<Vec<String>> {
             .then_with(|| left.1.cmp(&right.1))
     });
     Ok(ordered.into_iter().map(|(_, name)| name).collect())
+}
+
+fn stored_order(config: &Config) -> Result<Vec<String>> {
+    let contents = match fs::read_to_string(&config.workspace_order_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut seen = HashSet::new();
+    let mut names = Vec::new();
+    for name in contents.lines() {
+        validate_name(name).map_err(|_| err("invalid workspace order"))?;
+        if !seen.insert(name.to_owned()) {
+            return Err(err("invalid workspace order"));
+        }
+        names.push(name.to_owned());
+    }
+    Ok(names)
+}
+
+fn ordered_names(config: &Config) -> Result<Vec<String>> {
+    let created = creation_order(config)?;
+    let mut available: HashSet<_> = created.iter().cloned().collect();
+    let mut ordered = Vec::with_capacity(created.len());
+    for name in stored_order(config)? {
+        if available.remove(&name) {
+            ordered.push(name);
+        }
+    }
+    ordered.extend(created.into_iter().filter(|name| available.contains(name)));
+    Ok(ordered)
+}
+
+fn write_order(config: &Config, names: &[String]) -> Result<()> {
+    config.secure_dir(&config.state_root)?;
+    let temporary = tempfile_path(&config.state_root, "workspace.order")?;
+    let result = (|| -> Result<()> {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        for name in names {
+            validate_name(name)?;
+            writeln!(output, "{name}")?;
+        }
+        output.sync_all()?;
+        fs::rename(&temporary, &config.workspace_order_file)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub fn reorder(config: &Config, source: &str, target: &str) -> Result<()> {
+    validate_name(source)?;
+    validate_name(target)?;
+    crate::snapshot::lock(config, &config.workspace_order_lock, || {
+        let mut names = ordered_names(config)?;
+        let Some(source_index) = names.iter().position(|name| name == source) else {
+            return Ok(());
+        };
+        let Some(target_index) = names.iter().position(|name| name == target) else {
+            return Ok(());
+        };
+        if source_index == target_index {
+            return Ok(());
+        }
+        let source = names.remove(source_index);
+        names.insert(target_index, source);
+        write_order(config, &names)
+    })
+}
+
+pub fn update_order(
+    config: &Config,
+    operation: impl FnOnce(&mut Vec<String>) -> Result<()>,
+) -> Result<()> {
+    crate::snapshot::lock(config, &config.workspace_order_lock, || {
+        let mut names = ordered_names(config)?;
+        operation(&mut names)?;
+        write_order(config, &names)
+    })
 }
 
 pub fn create_session(config: &Config, workspace: &Workspace, initial_path: &str) -> Result<()> {
@@ -487,8 +578,11 @@ mod tests {
             workspaces: root.join("workspaces"),
             debug_log: root.join("debug.log"),
             restore_file: root.join("restore.snapshot"),
+            workspace_order_file: root.join("workspace.order"),
             ssh_destinations_file: root.join("ssh-destinations"),
             snapshot_lock: root.join(".snapshot.lock"),
+            workspace_order_lock: root.join(".workspace-order.lock"),
+            status_lock: root.join(".status.lock"),
             adoption_lock: root.join(".adoption.lock"),
             restore_lock: root.join(".restore.lock"),
         }
@@ -533,5 +627,69 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let config = config(temporary.path());
         assert_eq!(normalise_name(&config, "/tmp/a..b", "", ""), "a--b");
+    }
+
+    #[test]
+    fn custom_order_migrates_from_creation_order_and_supports_mutation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        for (name, created) in [("one", "1"), ("two", "2"), ("three", "3")] {
+            let mut workspace = Workspace::new(name, "local", "/tmp", None).unwrap();
+            workspace.created = created.into();
+            write(&config, &workspace, true).unwrap();
+        }
+
+        assert_eq!(all_names(&config).unwrap(), ["one", "two", "three"]);
+        assert!(!config.workspace_order_file.exists());
+
+        reorder(&config, "one", "three").unwrap();
+        assert_eq!(all_names(&config).unwrap(), ["two", "three", "one"]);
+        assert_eq!(
+            fs::read_to_string(&config.workspace_order_file).unwrap(),
+            "two\nthree\none\n"
+        );
+        assert_eq!(
+            fs::metadata(&config.workspace_order_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        update_order(&config, |names| {
+            let index = names.iter().position(|name| name == "three").unwrap();
+            names[index] = "renamed".into();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(&config.workspace_order_file).unwrap(),
+            "two\nrenamed\none\n"
+        );
+    }
+
+    #[test]
+    fn concurrent_reorders_keep_a_complete_valid_order() {
+        let temporary = tempfile::tempdir().unwrap();
+        let config = config(temporary.path());
+        for (name, created) in [("one", "1"), ("two", "2"), ("three", "3")] {
+            let mut workspace = Workspace::new(name, "local", "/tmp", None).unwrap();
+            workspace.created = created.into();
+            write(&config, &workspace, true).unwrap();
+        }
+        let first = config.clone();
+        let second = config.clone();
+        let one = std::thread::spawn(move || reorder(&first, "one", "three"));
+        let two = std::thread::spawn(move || reorder(&second, "three", "one"));
+        one.join().unwrap().unwrap();
+        two.join().unwrap().unwrap();
+
+        let names = all_names(&config).unwrap();
+        assert_eq!(names.len(), 3);
+        assert!(names.iter().any(|name| name == "one"));
+        assert!(names.iter().any(|name| name == "two"));
+        assert!(names.iter().any(|name| name == "three"));
+        assert_eq!(stored_order(&config).unwrap(), names);
     }
 }

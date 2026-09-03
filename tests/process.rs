@@ -80,14 +80,11 @@ impl TestEnv {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let output = self.command(&self.cli).args(args).output().unwrap();
         assert!(
-            self.command(&self.cli)
-                .args(args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -121,7 +118,11 @@ impl TestEnv {
         S: AsRef<OsStr>,
     {
         let output = self.tmux(args);
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         String::from_utf8(output.stdout)
             .unwrap()
             .trim_end_matches('\n')
@@ -130,6 +131,22 @@ impl TestEnv {
 
     fn workspace(&self, name: &str) -> PathBuf {
         self.state.join("workspaces").join(name)
+    }
+
+    fn workspace_token(&self, name: &str) -> String {
+        let generation: u32 = self
+            .tmux_text(["show-options", "-gqv", "@atelier_range_generation"])
+            .parse()
+            .unwrap();
+        let prefix = format!("@atelier_range_a{generation:x}_");
+        self.tmux_text(["show-options", "-g"])
+            .lines()
+            .find_map(|line| {
+                let (option, value) = line.split_once(' ')?;
+                (option.starts_with(&prefix) && value == name)
+                    .then(|| option.trim_start_matches("@atelier_range_").to_owned())
+            })
+            .unwrap_or_else(|| panic!("missing status token for {name}"))
     }
 
     fn scripted(&self, responses: &str) -> PathBuf {
@@ -301,6 +318,14 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
         env.tmux_text(["show-options", "-gqv", "@atelier_restore"]),
         "prompt"
     );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_source_style"]),
+        "default,reverse,dim"
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_target_style"]),
+        "underscore"
+    );
     let status = env.tmux_text(["show-options", "-gqv", "@atelier_tabs_format"]);
     assert!(status.contains("::"));
     assert!(status.contains("range=window"));
@@ -320,6 +345,14 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     assert!(mouse_keys.contains("MouseDown3Status"), "{mouse_keys}");
     assert!(mouse_keys.contains("internal status-menu"), "{mouse_keys}");
     assert!(mouse_keys.contains("#{window_id}"), "{mouse_keys}");
+    assert!(mouse_keys.contains("MouseDown1Status"), "{mouse_keys}");
+    assert!(mouse_keys.contains("internal drag-start"), "{mouse_keys}");
+    assert!(mouse_keys.contains("#{client_pid}"), "{mouse_keys}");
+    assert!(mouse_keys.contains("MouseDragEnd1Status"), "{mouse_keys}");
+    assert!(mouse_keys.contains("internal drag-end"), "{mouse_keys}");
+    assert!(mouse_keys.contains("MouseDrag1Status"), "{mouse_keys}");
+    assert!(mouse_keys.contains("internal drag-update"), "{mouse_keys}");
+    assert!(mouse_keys.contains("internal status-click"), "{mouse_keys}");
     let workspace_status =
         env.tmux_text(["show-options", "-qv", "-t", "=native:", "status-format[1]"]);
     assert!(workspace_status.contains("list=focus"));
@@ -329,6 +362,7 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     assert!(hooks.contains("internal snapshot"));
     assert!(hooks.contains("internal restore-start"));
     assert!(hooks.contains("internal adopt-session"));
+    assert!(hooks.contains("internal cleanup-drags"));
 
     env.tmux_ok(["set-option", "-g", "@atelier_new_workspace_key", "off"]);
     let output = env
@@ -338,6 +372,173 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
     assert!(output.status.success());
     let keys = env.tmux_text(["list-keys", "-T", "prefix"]);
     assert!(!keys.contains("internal popup-new"), "{keys}");
+}
+
+#[test]
+fn drag_tracking_is_isolated_and_cleans_every_temporary_resource() {
+    let env = TestEnv::new();
+    env.tmux_ok(["new-session", "-d", "-s", "native"]);
+    env.ok([
+        "internal",
+        "configure",
+        env.repo.to_str().unwrap(),
+        env.cli.to_str().unwrap(),
+    ]);
+    let token = env.workspace_token("native");
+    let old_mapping = format!("@atelier_range_{token}");
+
+    env.ok(["internal", "drag-start", &token, "", "301"]);
+    env.ok(["internal", "drag-start", &token, "", "302"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_kind_301"]),
+        "workspace"
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_source_302"]),
+        "native"
+    );
+    env.tmux_ok(["set-option", "-gq", "@atelier_drag_target_301", &token]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_drag_target_302", "different"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_target_301"]),
+        token
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_target_302"]),
+        "different"
+    );
+
+    let table = env.tmux_text(["list-keys", "-T", "atelier-drag-301"]);
+    assert!(table.contains("MouseDrag1Status"), "{table}");
+    assert!(table.contains("MouseDrag1Pane"), "{table}");
+    assert!(table.contains("MouseDrag1ScrollbarSlider"), "{table}");
+    assert!(table.contains("MouseDrag1Control9"), "{table}");
+    assert!(table.contains("MouseDragEnd1StatusDefault"), "{table}");
+    assert!(table.contains("@atelier_drag_target_301"), "{table}");
+    assert!(table.contains("refresh-client -S"), "{table}");
+    assert!(table.contains("bind-key -r"), "{table}");
+    assert!(table.contains("internal drag-update"), "{table}");
+    assert!(!table.contains("set-option -gqF"), "{table}");
+
+    let generation: u32 = env
+        .tmux_text(["show-options", "-gqv", "@atelier_range_generation"])
+        .parse()
+        .unwrap();
+    env.ok(["internal", "refresh-status"]);
+    env.ok(["internal", "refresh-status"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_range_generation"]),
+        generation.wrapping_add(2).to_string()
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", &old_mapping]),
+        "native"
+    );
+
+    env.ok(["internal", "drag-cancel", "301"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_source_301"]),
+        ""
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_target_302"]),
+        "different"
+    );
+    env.ok(["internal", "drag-cancel", "302"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_kind_302"]),
+        ""
+    );
+    assert!(
+        !env.tmux(["list-keys", "-T", "atelier-drag-302"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn attached_client_expands_semantic_source_and_target_styles() {
+    let env = TestEnv::new();
+    for name in ["source", "target"] {
+        let path = env.root.path().join(name);
+        fs::create_dir(&path).unwrap();
+        env.ok([
+            "new",
+            &format!("local:{}", path.display()),
+            name,
+            "--detached",
+        ]);
+    }
+    let mut control = env
+        .command(&env.tmux)
+        .args(["-C", "attach-session", "-t", "=source"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut client = String::new();
+    for _ in 0..50 {
+        client = env
+            .tmux_text(["list-clients", "-F", "#{client_pid}\t#{client_name}"])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if !client.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (client_id, client_name) = client.split_once('\t').unwrap();
+    env.ok([
+        "internal",
+        "configure",
+        env.repo.to_str().unwrap(),
+        env.cli.to_str().unwrap(),
+    ]);
+    let source = env.workspace_token("source");
+    env.ok(["internal", "drag-start", &source, client_name, client_id]);
+    let target = env.workspace_token("target");
+    env.ok(["internal", "drag-update", &target, client_name, client_id]);
+    let rendered = env.tmux_text([
+        "display-message",
+        "-p",
+        "-c",
+        client_name,
+        "#{E:status-format[1]}",
+    ]);
+    assert!(rendered.contains("#[default,reverse,dim]"), "{rendered}");
+    assert!(rendered.contains("#[reverse,underscore]"), "{rendered}");
+
+    env.tmux_ok(["detach-client", "-t", client_name]);
+    control.wait().unwrap();
+    for _ in 0..50 {
+        if env
+            .tmux_text([
+                "show-options",
+                "-gqv",
+                &format!("@atelier_drag_source_{client_id}"),
+            ])
+            .is_empty()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        env.tmux_text([
+            "show-options",
+            "-gqv",
+            &format!("@atelier_drag_source_{client_id}"),
+        ]),
+        ""
+    );
+    assert!(
+        !env.tmux(["list-keys", "-T", &format!("atelier-drag-{client_id}")])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -366,6 +567,219 @@ fn tab_navigation_selects_adjacent_windows() {
     assert_eq!(
         env.tmux_text(["display-message", "-p", "-t", "=tabs:", "#{window_index}"]),
         "1"
+    );
+}
+
+#[test]
+fn workspace_drag_order_survives_rename_delete_and_native_sessions() {
+    let env = TestEnv::new();
+    for name in ["one", "two", "three"] {
+        let path = env.root.path().join(name);
+        fs::create_dir(&path).unwrap();
+        env.ok([
+            "new",
+            &format!("local:{}", path.display()),
+            name,
+            "--detached",
+        ]);
+    }
+    env.ok([
+        "internal",
+        "configure",
+        env.repo.to_str().unwrap(),
+        env.cli.to_str().unwrap(),
+    ]);
+    let source = env.workspace_token("one");
+    let target = env.workspace_token("three");
+    env.ok(["internal", "drag-start", &source, "", "101"]);
+    env.ok(["internal", "drag-end", &target, "", "101"]);
+    let order = env.state.join("workspace.order");
+    assert_eq!(fs::read_to_string(&order).unwrap(), "two\nthree\none\n");
+    assert_eq!(
+        fs::metadata(&order).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    env.ok(["rename", "three", "renamed"]);
+    assert_eq!(fs::read_to_string(&order).unwrap(), "two\nrenamed\none\n");
+    env.ok(["delete", "renamed"]);
+    assert_eq!(fs::read_to_string(&order).unwrap(), "two\none\n");
+
+    env.tmux_ok(["set-hook", "-gu", "session-created[91]"]);
+    env.tmux_ok(["new-session", "-d", "-s", "native"]);
+    env.ok(["internal", "refresh-status"]);
+    let source = env.workspace_token("native");
+    let target = env.workspace_token("two");
+    env.ok(["internal", "drag-start", &source, "", "102"]);
+    env.ok(["internal", "drag-end", &target, "", "102"]);
+    assert_eq!(fs::read_to_string(order).unwrap(), "native\ntwo\none\n");
+}
+
+#[test]
+fn tab_drag_inserts_real_windows_snapshots_and_keeps_plain_clicks() {
+    let env = TestEnv::new();
+    env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
+    let path = env.root.path().join("tab-drag");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "tab-drag",
+        "--detached",
+    ]);
+    env.ok(["window", "tab-drag"]);
+    env.ok(["window", "tab-drag"]);
+    env.ok([
+        "internal",
+        "configure",
+        env.repo.to_str().unwrap(),
+        env.cli.to_str().unwrap(),
+    ]);
+    let windows = env
+        .tmux_text(["list-windows", "-t", "=tab-drag", "-F", "#{window_id}"])
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (window, name) in windows.iter().zip(["first", "second", "third"]) {
+        env.tmux_ok(["rename-window", "-t", window, name]);
+    }
+    let original_indexes =
+        env.tmux_text(["list-windows", "-t", "=tab-drag", "-F", "#{window_index}"]);
+
+    env.ok(["internal", "drag-start", "window", "", "201", &windows[0]]);
+    env.ok(["internal", "drag-end", "window", "", "201", &windows[2]]);
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=tab-drag", "-F", "#{window_id}",])
+            .lines()
+            .collect::<Vec<_>>(),
+        [&windows[1], &windows[2], &windows[0]]
+    );
+    env.ok(["internal", "drag-start", "window", "", "202", &windows[2]]);
+    env.ok(["internal", "drag-end", "window", "", "202", &windows[1]]);
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=tab-drag", "-F", "#{window_id}",])
+            .lines()
+            .collect::<Vec<_>>(),
+        [&windows[2], &windows[1], &windows[0]]
+    );
+    assert_eq!(
+        env.tmux_text(["list-windows", "-t", "=tab-drag", "-F", "#{window_index}",]),
+        original_indexes
+    );
+    let saved = Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    let live_indexes = env
+        .tmux_text(["list-windows", "-t", "=tab-drag", "-F", "#{window_index}"])
+        .lines()
+        .map(|index| index.parse::<u32>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        saved.workspaces[0]
+            .windows
+            .iter()
+            .map(|window| window.index)
+            .collect::<Vec<_>>(),
+        live_indexes
+    );
+    assert_eq!(
+        saved.workspaces[0]
+            .windows
+            .iter()
+            .map(|window| window.name.as_str())
+            .collect::<Vec<_>>(),
+        ["third", "second", "first"]
+    );
+
+    env.ok(["internal", "drag-start", "window", "", "203", &windows[2]]);
+    env.ok(["internal", "drag-update", "window", "", "203"]);
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_target_203"]),
+        ""
+    );
+    env.ok([
+        "internal",
+        "status-click",
+        "window",
+        "",
+        "203",
+        "tab-drag",
+        &windows[2],
+    ]);
+    assert_eq!(
+        env.tmux_text(["display-message", "-p", "-t", "=tab-drag:", "#{window_id}",]),
+        windows[2]
+    );
+    assert_eq!(
+        env.tmux_text(["show-options", "-gqv", "@atelier_drag_source_203"]),
+        ""
+    );
+
+    thread::sleep(Duration::from_millis(200));
+    let drag_snapshot = fs::read(env.state.join("restore.snapshot")).unwrap();
+    env.tmux_ok(["kill-session", "-t", "=tab-drag"]);
+    thread::sleep(Duration::from_millis(200));
+    fs::write(env.state.join("restore.snapshot"), drag_snapshot).unwrap();
+    env.tmux_ok(["set-option", "-gq", "@atelier_restore", "always"]);
+    env.tmux_ok(["set-option", "-gu", "@atelier_restore_handled"]);
+    env.tmux_ok(["set-option", "-gu", "@atelier_restore_pending"]);
+    env.tmux_ok(["set-option", "-gu", "@atelier_restore_started"]);
+    env.ok(["internal", "restore-arm"]);
+    env.ok(["internal", "restore-start"]);
+    assert_eq!(
+        env.tmux_text([
+            "list-windows",
+            "-t",
+            "=tab-drag",
+            "-F",
+            "#{window_index}\t#{window_name}",
+        ]),
+        live_indexes
+            .iter()
+            .zip(["third", "second", "first"])
+            .map(|(index, name)| format!("{index}\t{name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn tab_drag_preserves_sparse_window_indexes() {
+    let env = TestEnv::new();
+    let path = env.root.path().join("sparse-tab-drag");
+    fs::create_dir(&path).unwrap();
+    env.ok([
+        "new",
+        &format!("local:{}", path.display()),
+        "sparse",
+        "--detached",
+    ]);
+    env.ok(["window", "sparse"]);
+    env.ok(["window", "sparse"]);
+    env.tmux_ok(["move-window", "-s", "=sparse:2", "-t", "=sparse:5"]);
+    env.tmux_ok(["move-window", "-s", "=sparse:1", "-t", "=sparse:3"]);
+    env.tmux_ok(["move-window", "-s", "=sparse:0", "-t", "=sparse:1"]);
+    env.ok(["internal", "snapshot"]);
+    env.ok([
+        "internal",
+        "configure",
+        env.repo.to_str().unwrap(),
+        env.cli.to_str().unwrap(),
+    ]);
+    let windows = env
+        .tmux_text(["list-windows", "-t", "=sparse", "-F", "#{window_id}"])
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    env.ok(["internal", "drag-start", "window", "", "204", &windows[0]]);
+    env.ok(["internal", "drag-end", "window", "", "204", &windows[2]]);
+    assert_eq!(
+        env.tmux_text([
+            "list-windows",
+            "-t",
+            "=sparse",
+            "-F",
+            "#{window_index}\t#{window_id}",
+        ]),
+        format!("1\t{}\n3\t{}\n5\t{}", windows[1], windows[2], windows[0])
     );
 }
 

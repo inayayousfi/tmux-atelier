@@ -100,35 +100,41 @@ pub(super) fn rename(app: &App, old: &str, new: &str) -> Result<()> {
     if old == new {
         return Ok(());
     }
-    let old_file = app.workspaces.join(old);
-    if app.workspaces.join(new).exists() {
-        return Err(err(format!("workspace already exists: {new}")));
-    }
-    if workspace::session_exists(app, new) {
-        return Err(err(format!("tmux session already exists: {new}")));
-    }
-    if !old_file.is_file() && !workspace::session_exists(app, old) {
-        return Err(err(format!("workspace not found: {old}")));
-    }
-    let definition = old_file
-        .is_file()
-        .then(|| workspace::read(app, old))
-        .transpose()?;
-    let mut renamed = false;
-    if workspace::session_exists(app, old) {
-        process::tmux(app, &["rename-session", "-t", &format!("={old}"), new])?;
-        renamed = true;
-    }
-    if let Some(mut definition) = definition {
-        definition.name = new.into();
-        if workspace::write(app, &definition, true).is_err() {
-            if renamed {
-                let _ = process::tmux(app, &["rename-session", "-t", &format!("={new}"), old]);
-            }
-            return Err(err(format!("could not rename workspace: {old}")));
+    workspace::update_order(app, |names| {
+        let old_file = app.workspaces.join(old);
+        if app.workspaces.join(new).exists() {
+            return Err(err(format!("workspace already exists: {new}")));
         }
-        fs::remove_file(old_file)?;
-    }
+        if workspace::session_exists(app, new) {
+            return Err(err(format!("tmux session already exists: {new}")));
+        }
+        if !old_file.is_file() && !workspace::session_exists(app, old) {
+            return Err(err(format!("workspace not found: {old}")));
+        }
+        let definition = old_file
+            .is_file()
+            .then(|| workspace::read(app, old))
+            .transpose()?;
+        let mut renamed = false;
+        if workspace::session_exists(app, old) {
+            process::tmux(app, &["rename-session", "-t", &format!("={old}"), new])?;
+            renamed = true;
+        }
+        if let Some(mut definition) = definition {
+            definition.name = new.into();
+            if workspace::write(app, &definition, true).is_err() {
+                if renamed {
+                    let _ = process::tmux(app, &["rename-session", "-t", &format!("={new}"), old]);
+                }
+                return Err(err(format!("could not rename workspace: {old}")));
+            }
+            fs::remove_file(old_file)?;
+        }
+        if let Some(index) = names.iter().position(|name| name == old) {
+            names[index] = new.into();
+        }
+        Ok(())
+    })?;
     app.snapshot("", "")?;
     app.refresh_status_if_running()
 }
@@ -240,7 +246,11 @@ pub(super) fn delete(app: &App, name: &str) -> Result<()> {
     if workspace::session_exists(app, name) {
         close(app, name)?;
     }
-    fs::remove_file(file)?;
+    workspace::update_order(app, |names| {
+        fs::remove_file(file)?;
+        names.retain(|entry| entry != name);
+        Ok(())
+    })?;
     app.snapshot("", "")?;
     app.refresh_status_if_running()
 }

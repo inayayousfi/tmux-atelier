@@ -400,6 +400,10 @@ pub fn lock<T>(config: &Config, path: &Path, operation: impl FnOnce() -> Result<
     if !acquired {
         return Err(err(if path == config.snapshot_lock {
             "could not acquire snapshot lock"
+        } else if path == config.workspace_order_lock {
+            "could not acquire workspace order lock"
+        } else if path == config.status_lock {
+            "could not acquire status refresh lock"
         } else if path == config.restore_lock {
             "could not acquire restore lock"
         } else {

@@ -107,8 +107,39 @@ impl App {
             InternalCommand::StatusClick {
                 token,
                 client,
+                client_id,
                 session,
-            } => ui::status_click(self, &token, client.as_deref(), session.as_deref()),
+                window,
+            } => ui::status_click(
+                self,
+                &token,
+                Some(&client),
+                &client_id,
+                session.as_deref(),
+                window.as_deref(),
+            ),
+            InternalCommand::DragStart {
+                token,
+                client,
+                client_id,
+                window,
+            } => ui::drag_start(self, &token, &client, &client_id, window.as_deref()),
+            InternalCommand::DragEnd {
+                token,
+                client,
+                client_id,
+                window,
+            } => ui::drag_end(self, &token, &client, &client_id, window.as_deref()),
+            InternalCommand::DragUpdate {
+                token,
+                client,
+                client_id,
+                window,
+            } => ui::drag_update(self, &token, &client, &client_id, window.as_deref()),
+            InternalCommand::DragCancel { client_id, client } => {
+                ui::drag_cancel(self, &client_id, client.as_deref())
+            }
+            InternalCommand::CleanupDrags => ui::cleanup_drags(self),
             InternalCommand::StatusMenu {
                 token,
                 client,
@@ -215,6 +246,8 @@ fn allowed_during_restore(command: &Command) -> bool {
             command: InternalCommand::Configure { .. }
                 | InternalCommand::PopupRestore { .. }
                 | InternalCommand::RefreshStatus
+                | InternalCommand::DragCancel { .. }
+                | InternalCommand::CleanupDrags
                 | InternalCommand::Snapshot
                 | InternalCommand::RestoreArm
                 | InternalCommand::RestoreStart { .. }

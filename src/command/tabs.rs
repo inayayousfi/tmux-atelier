@@ -10,6 +10,60 @@ pub(super) fn navigate(app: &App, direction: Direction, session: &str) -> Result
     process::tmux(app, &["select-window", flag, "-t", &format!("={session}:")])
 }
 
+pub(super) fn reorder(app: &App, source: &str, target: &str) -> Result<()> {
+    validate_window(source)?;
+    validate_window(target)?;
+    if source == target {
+        return Ok(());
+    }
+    let describe = |window: &str| {
+        process::tmux_output(
+            app,
+            &["display-message", "-p", "-t", window, "#{session_name}"],
+        )
+    };
+    let source_session = describe(source)?;
+    let target_session = describe(target)?;
+    if source_session != target_session {
+        return Ok(());
+    }
+    let windows = process::tmux_output(
+        app,
+        &[
+            "list-windows",
+            "-t",
+            &format!("={source_session}"),
+            "-F",
+            "#{window_id}",
+        ],
+    )?;
+    let windows = windows.lines().collect::<Vec<_>>();
+    let source_position = windows
+        .iter()
+        .position(|window| *window == source)
+        .ok_or_else(|| err("could not identify dragged tab"))?;
+    let target_position = windows
+        .iter()
+        .position(|window| *window == target)
+        .ok_or_else(|| err("could not identify target tab"))?;
+    let adjacent = if source_position < target_position {
+        windows[source_position + 1..=target_position].to_vec()
+    } else {
+        windows[target_position..source_position]
+            .iter()
+            .rev()
+            .copied()
+            .collect()
+    };
+    for adjacent in adjacent {
+        if let Err(error) = process::tmux(app, &["swap-window", "-s", source, "-t", adjacent]) {
+            let _ = app.snapshot("", "");
+            return Err(error);
+        }
+    }
+    app.snapshot("", "")
+}
+
 pub(super) fn window(app: &App, session: Option<&str>) -> Result<()> {
     let session = match session {
         Some(value) => value.into(),

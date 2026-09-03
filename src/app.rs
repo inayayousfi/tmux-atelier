@@ -131,9 +131,34 @@ pub(crate) enum InternalCommand {
     },
     StatusClick {
         token: String,
-        client: Option<String>,
+        client: String,
+        client_id: String,
         session: Option<String>,
+        window: Option<String>,
     },
+    DragStart {
+        token: String,
+        client: String,
+        client_id: String,
+        window: Option<String>,
+    },
+    DragEnd {
+        token: String,
+        client: String,
+        client_id: String,
+        window: Option<String>,
+    },
+    DragUpdate {
+        token: String,
+        client: String,
+        client_id: String,
+        window: Option<String>,
+    },
+    DragCancel {
+        client_id: String,
+        client: Option<String>,
+    },
+    CleanupDrags,
     StatusMenu {
         token: String,
         client: Option<String>,

@@ -11,6 +11,8 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
         ("@atelier_workspace_active_style", "reverse"),
         ("@atelier_workspace_live_style", "bold"),
         ("@atelier_workspace_stopped_style", "dim"),
+        ("@atelier_drag_source_style", "default,reverse,dim"),
+        ("@atelier_drag_target_style", "underscore"),
         ("@atelier_add_style", "bold"),
         ("@atelier_separator", "│"),
         ("@atelier_tab_separator", "│"),
@@ -30,21 +32,9 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
 
     let option =
         |name: &str| process::tmux_quiet(app, &["show-options", "-gqv", name]).unwrap_or_default();
-    let tab_style = option("@atelier_tab_style");
-    let active_style = option("@atelier_tab_active_style");
     let add_style = option("@atelier_add_style");
-    let separator = option("@atelier_tab_separator").replace('#', "##");
     let title = option("@atelier_terminal_title");
-    let tabs = format!(
-        "{separator}#{{W:#[range=window|#{{window_index}} {tab_style}] #I #W #[norange default]{separator},#[list=focus range=window|#{{window_index}} {active_style}] #I #W #[norange default]{separator}#[list=on]}}#[range=user|new-tab {add_style}] + #[default,norange]"
-    );
-    let status = if option("@atelier_status_sides") == "on" {
-        format!(
-            "#[align=left range=left #{{E:status-left-style}}]#[push-default]#{{T;=/#{{status-left-length}}:status-left}}#[pop-default]#[norange default]#[list=on align=#{{status-justify}}]{tabs}#[nolist align=right range=right #{{E:status-right-style}}]#[push-default]#{{T;=/#{{status-right-length}}:status-right}}#[pop-default]#[norange default]"
-        )
-    } else {
-        format!("#[list=on align=left]{tabs}#[nolist]")
-    };
+    let status = tabs_format(app, &ui::client_ids(app));
     let executable = quote_sh(&cli.to_string_lossy());
     let internal = |command: &str| format!("{executable} internal {command}");
 
@@ -66,24 +56,26 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
         process::tmux(app, &["set-option", "-g", option, value])?;
     }
 
-    process::tmux(app, &["unbind-key", "-n", "MouseDown1Status"])?;
+    let drag_start = format!(
+        "run-shell \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{client_pid}}\\\" \\\"#{{window_id}}\\\"\"",
+        internal("drag-start")
+    );
+    process::tmux(app, &["bind-key", "-n", "MouseDown1Status", &drag_start])?;
     let click = format!(
-        "run-shell -b \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{session_name}}\\\"\"",
+        "run-shell \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{client_pid}}\\\" \\\"#{{session_name}}\\\" \\\"#{{window_id}}\\\"\"",
         internal("status-click")
     );
-    process::tmux(
-        app,
-        &[
-            "bind-key",
-            "-n",
-            "MouseUp1Status",
-            "if-shell",
-            "-F",
-            "#{==:#{mouse_status_range},window}",
-            "select-window -t =",
-            &click,
-        ],
-    )?;
+    process::tmux(app, &["bind-key", "-n", "MouseUp1Status", &click])?;
+    let drag_end = format!(
+        "run-shell \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{client_pid}}\\\" \\\"#{{window_id}}\\\"\"",
+        internal("drag-end")
+    );
+    process::tmux(app, &["bind-key", "-n", "MouseDragEnd1Status", &drag_end])?;
+    let drag_update = format!(
+        "run-shell \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{client_pid}}\\\" \\\"#{{window_id}}\\\"\"",
+        internal("drag-update")
+    );
+    process::tmux(app, &["bind-key", "-n", "MouseDrag1Status", &drag_update])?;
     let menu = format!(
         "run-shell -b \"exec {} \\\"#{{mouse_status_range}}\\\" \\\"#{{client_name}}\\\" \\\"#{{window_id}}\\\"\"",
         internal("status-menu")
@@ -130,6 +122,20 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
             ),
         ],
     )?;
+    let refresh_clients = format!("run-shell -b \"{}\"", internal("refresh-status"));
+    process::tmux(
+        app,
+        &["set-hook", "-g", "client-attached[92]", &refresh_clients],
+    )?;
+    process::tmux(
+        app,
+        &[
+            "set-hook",
+            "-g",
+            "client-detached[92]",
+            &format!("run-shell -b \"{}\"", internal("cleanup-drags")),
+        ],
+    )?;
     process::tmux(
         app,
         &[
@@ -166,6 +172,31 @@ pub(super) fn run(app: &App, root: &Path, cli: &Path) -> Result<()> {
     )?;
     ui::refresh_status(app)?;
     restart::arm(app)
+}
+
+pub(super) fn tabs_format(app: &App, clients: &[String]) -> String {
+    let option =
+        |name: &str| process::tmux_quiet(app, &["show-options", "-gqv", name]).unwrap_or_default();
+    let tab_style = option("@atelier_tab_style");
+    let active_style = option("@atelier_tab_active_style");
+    let add_style = option("@atelier_add_style");
+    let separator = option("@atelier_tab_separator").replace('#', "##");
+    let overlay = ui::drag_overlays(
+        clients,
+        "#{window_id}",
+        "#{window_id}",
+        "@atelier_tab_active_style",
+    );
+    let tabs = format!(
+        "{separator}#{{W:#[range=window|#{{window_index}} {tab_style}]{overlay} #I #W #[norange default]{separator},#[list=focus range=window|#{{window_index}} {active_style}]{overlay} #I #W #[norange default]{separator}#[list=on]}}#[range=user|new-tab {add_style}] + #[default,norange]"
+    );
+    if option("@atelier_status_sides") == "on" {
+        format!(
+            "#[align=left range=left #{{E:status-left-style}}]#[push-default]#{{T;=/#{{status-left-length}}:status-left}}#[pop-default]#[norange default]#[list=on align=#{{status-justify}}]{tabs}#[nolist align=right range=right #{{E:status-right-style}}]#[push-default]#{{T;=/#{{status-right-length}}:status-right}}#[pop-default]#[norange default]"
+        )
+    } else {
+        format!("#[list=on align=left]{tabs}#[nolist]")
+    }
 }
 
 fn set_default(app: &App, option: &str, value: &str) -> Result<()> {
