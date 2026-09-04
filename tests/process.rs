@@ -1996,7 +1996,9 @@ fn snapshot_restores_foreground_process_and_returns_to_shell() {
     thread::sleep(Duration::from_millis(200));
     env.tmux_ok(["send-keys", "-l", "-t", &pane, "sleep 30"]);
     env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
-    thread::sleep(Duration::from_millis(200));
+    env.tmux_ok(["set-option", "-gq", "@atelier_restart_min_runtime", "1"]);
+    env.tmux_ok(["set-option", "-gq", "@atelier_restart_denylist", "sleep"]);
+    thread::sleep(Duration::from_millis(1200));
     let current = env.tmux_text([
         "display-message",
         "-p",
@@ -2014,6 +2016,11 @@ fn snapshot_restores_foreground_process_and_returns_to_shell() {
             .process
             .is_none()
     );
+    let capture_log = fs::read_to_string(env.state.join("debug.log")).unwrap();
+    assert!(capture_log.contains("process capture pane="));
+    assert!(capture_log.contains(
+        "policy=auto decision=denylisted program=sleep executable=/usr/bin/sleep arguments=2 denied=/usr/bin/sleep"
+    ));
 
     env.ok(["restart-policy", "always", &pane]);
 
@@ -2086,6 +2093,23 @@ fn snapshot_restores_foreground_process_and_returns_to_shell() {
         ]),
         shell
     );
+    let restore_log = fs::read_to_string(env.state.join("debug.log")).unwrap();
+    for event in [
+        "restore pane planned location=process-restore:0.0 action=launch-process kind=process program=sleep executable=/usr/bin/sleep arguments=2",
+        "restore pane launch requested location=process-restore:0.0",
+        "restore pane launch accepted location=process-restore:0.0",
+        "process launcher starting program=sleep executable=/usr/bin/sleep arguments=2",
+        "process launcher spawned program=sleep child_pid=",
+        "process launcher terminal handed off program=sleep child_pid=",
+        "process launcher exited program=sleep child_pid=",
+        "signal=2",
+        "process launcher returning to shell program=sleep shell=",
+    ] {
+        assert!(
+            restore_log.contains(event),
+            "missing log event: {event}\n{restore_log}"
+        );
+    }
 
     env.tmux_ok([
         "send-keys",
@@ -2124,15 +2148,6 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    let wait_for_marker = || {
-        for _ in 0..1000 {
-            if matches!(fs::read_to_string(&marker), Ok(contents) if contents == "original") {
-                return true;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        false
-    };
     env.ok([
         "new",
         &format!("local:{}", path.display()),
@@ -2151,11 +2166,34 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
         "-l",
         "-t",
         &pane,
-        &format!("{} original", script.display()),
+        &format!("{} secret-process-argument", script.display()),
     ]);
     env.tmux_ok(["send-keys", "-t", &pane, "Enter"]);
+    let wait_for_marker = || {
+        for _ in 0..2000 {
+            if matches!(
+                fs::read_to_string(&marker),
+                Ok(contents) if contents == "secret-process-argument"
+            ) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
     assert!(wait_for_marker(), "initial script did not write its marker");
     env.ok(["restart-policy", "always", &pane]);
+    let saved = Snapshot::decode(&fs::read(env.state.join("restore.snapshot")).unwrap()).unwrap();
+    let argument_count = saved.workspaces[0].windows[0].panes[0]
+        .process
+        .as_ref()
+        .unwrap()
+        .argv
+        .len();
+    let log = fs::read_to_string(env.state.join("debug.log")).unwrap();
+    assert!(log.contains("policy=always decision=restartable"));
+    assert!(log.contains(&format!("arguments={argument_count}")));
+    assert!(!log.contains("secret-process-argument"));
     fs::remove_file(&marker).unwrap();
     env.tmux_ok(["new-session", "-d", "-s", "bootstrap"]);
     env.tmux_ok(["kill-session", "-t", "=script-restore"]);
@@ -2169,8 +2207,9 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
     );
     assert!(
         wait_for_marker(),
-        "restored script did not write its marker: {}",
-        String::from_utf8_lossy(&restore.stderr)
+        "restored script did not write its marker: {}\n{}",
+        String::from_utf8_lossy(&restore.stderr),
+        fs::read_to_string(env.state.join("debug.log")).unwrap_or_default()
     );
 }
 

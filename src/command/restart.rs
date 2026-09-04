@@ -1,4 +1,5 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,10 +45,27 @@ pub(super) fn poll(app: &App, generation: &str) -> Result<()> {
     }
 }
 
-pub(super) fn pane_run(shell: &str, login: bool, executable: &str, argv: &[String]) -> Result<()> {
+pub(super) fn pane_run(
+    debug_log: &Path,
+    shell: &str,
+    login: bool,
+    executable: &str,
+    argv: &[String],
+) -> Result<()> {
     if argv.is_empty() {
         return Err(err("pane runner requires a command"));
     }
+    let program = argv.first().map(String::as_str).unwrap_or(executable);
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher starting program={} executable={} arguments={} shell={} login={login}",
+            crate::config::shell_debug(program),
+            crate::config::shell_debug(executable),
+            argv.len(),
+            crate::config::shell_debug(shell),
+        ),
+    );
     let cli = std::env::current_exe()?;
     let mut command = format!(
         "{} internal process-exec --executable {} --",
@@ -62,19 +80,91 @@ pub(super) fn pane_run(shell: &str, login: bool, executable: &str, argv: &[Strin
     if login {
         child.arg("-l");
     }
-    let mut child = child
+    let mut child = match child
         .args(["-i", "-c", &format!("exec {command}")])
         .process_group(0)
-        .spawn()?;
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = crate::config::debug_to(
+                debug_log,
+                &format!(
+                    "process launcher spawn failed program={} error={error}",
+                    crate::config::shell_debug(program)
+                ),
+            );
+            return Err(error.into());
+        }
+    };
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher spawned program={} child_pid={}",
+            crate::config::shell_debug(program),
+            child.id()
+        ),
+    );
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
     if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, child.id() as libc::pid_t) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let error = std::io::Error::last_os_error();
+        let _ = crate::config::debug_to(
+            debug_log,
+            &format!(
+                "process launcher terminal handoff failed program={} child_pid={} error={error}",
+                crate::config::shell_debug(program),
+                child.id()
+            ),
+        );
+        return Err(error.into());
     }
-    let status = child.wait()?;
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher terminal handed off program={} child_pid={}",
+            crate::config::shell_debug(program),
+            child.id()
+        ),
+    );
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = crate::config::debug_to(
+                debug_log,
+                &format!(
+                    "process launcher wait failed program={} child_pid={} error={error}",
+                    crate::config::shell_debug(program),
+                    child.id()
+                ),
+            );
+            return Err(error.into());
+        }
+    };
+    let outcome = if let Some(signal) = status.signal() {
+        format!("signal={signal}")
+    } else {
+        format!("status={}", status.code().unwrap_or(1))
+    };
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher exited program={} child_pid={} {outcome}",
+            crate::config::shell_debug(program),
+            child.id()
+        ),
+    );
     if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
+        let error = std::io::Error::last_os_error();
+        let _ = crate::config::debug_to(
+            debug_log,
+            &format!(
+                "process launcher terminal reclaim failed program={} error={error}",
+                crate::config::shell_debug(program)
+            ),
+        );
+        return Err(error.into());
     }
     if !status.success() {
         if let Some(signal) = status.signal() {
@@ -94,7 +184,23 @@ pub(super) fn pane_run(shell: &str, login: bool, executable: &str, argv: &[Strin
     if login {
         restored_shell.arg("-l");
     }
-    Err(restored_shell.exec().into())
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher returning to shell program={} shell={} login={login}",
+            crate::config::shell_debug(program),
+            crate::config::shell_debug(shell)
+        ),
+    );
+    let error = restored_shell.exec();
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher shell fallback failed program={} error={error}",
+            crate::config::shell_debug(program)
+        ),
+    );
+    Err(error.into())
 }
 
 pub(super) fn process_exec(executable: &str, argv: &[String]) -> Result<()> {

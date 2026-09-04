@@ -217,7 +217,7 @@ set-option -g @atelier_restart_min_runtime 5
 
 Set `@atelier_restart_interval` to `off` to disable process capture and restoration. Polling rewrites the snapshot only when pane state changes. macOS and remote panes currently restore topology without foreground processes.
 
-Automatic capture excludes a process when any executable in its foreground ancestry matches this default basename denylist:
+Automatic capture checks the root foreground command against this default executable-basename denylist. Helper processes do not block their parent command: for example, OpenCode remains eligible when it starts a denylisted `node` MCP server. A root command that is itself `node` remains excluded.
 
 ```text
 awk bash basename cat chmod chown cmake cp curl cut date dd diff dirname du

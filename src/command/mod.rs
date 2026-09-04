@@ -181,8 +181,9 @@ impl App {
                 shell,
                 login,
                 executable,
+                debug_log,
                 argv,
-            } => restart::pane_run(&shell, login, &executable, &argv),
+            } => restart::pane_run(&debug_log, &shell, login, &executable, &argv),
             InternalCommand::ProcessExec { executable, argv } => {
                 restart::process_exec(&executable, &argv)
             }

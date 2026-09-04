@@ -55,6 +55,24 @@ pub struct PaneRuntime {
     pub foreground: ObservedForeground,
     pub restartable: Option<SavedProcess>,
     pub policy: RestartPolicy,
+    pub capture: CaptureDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CaptureDecision {
+    Idle,
+    Busy {
+        processes: usize,
+    },
+    Never,
+    TooYoung {
+        runtime: Duration,
+        minimum: Duration,
+    },
+    Denylisted {
+        executable: String,
+    },
+    Restartable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -128,6 +146,7 @@ impl ProcessInspector {
                 foreground: ObservedForeground::Idle,
                 restartable: None,
                 policy,
+                capture: CaptureDecision::Idle,
             });
         }
         let group: HashMap<_, _> = self
@@ -156,6 +175,9 @@ impl ProcessInspector {
                 foreground: ObservedForeground::Busy(processes),
                 restartable: None,
                 policy,
+                capture: CaptureDecision::Busy {
+                    processes: group.len(),
+                },
             });
         }
         let root = roots[0];
@@ -163,25 +185,29 @@ impl ProcessInspector {
             executable: root.executable.clone(),
             argv: root.argv.clone(),
         };
-        let restartable = match policy {
-            RestartPolicy::Never => None,
-            RestartPolicy::Always => Some(foreground.clone()),
+        let (restartable, capture) = match policy {
+            RestartPolicy::Never => (None, CaptureDecision::Never),
+            RestartPolicy::Always => (Some(foreground.clone()), CaptureDecision::Restartable),
             RestartPolicy::Auto => {
                 let minimum = minimum_runtime(config)?;
-                let old_enough = process_runtime(root.start_ticks)? >= minimum;
+                let runtime = process_runtime(root.start_ticks)?;
                 let denylist = process::tmux_quiet(
                     config,
                     &["show-options", "-gqv", "@atelier_restart_denylist"],
                 )
                 .unwrap_or_else(|| DEFAULT_DENYLIST.into());
-                let denied = group.values().any(|entry| {
-                    Path::new(&entry.executable)
-                        .file_name()
-                        .is_some_and(|name| {
-                            denylist.split_ascii_whitespace().any(|item| name == item)
-                        })
-                });
-                (old_enough && !denied).then_some(foreground.clone())
+                if runtime < minimum {
+                    (None, CaptureDecision::TooYoung { runtime, minimum })
+                } else if executable_is_denylisted(&root.executable, &denylist) {
+                    (
+                        None,
+                        CaptureDecision::Denylisted {
+                            executable: root.executable.clone(),
+                        },
+                    )
+                } else {
+                    (Some(foreground.clone()), CaptureDecision::Restartable)
+                }
             }
         };
         Ok(PaneRuntime {
@@ -189,8 +215,15 @@ impl ProcessInspector {
             foreground: ObservedForeground::Process(foreground),
             restartable,
             policy,
+            capture,
         })
     }
+}
+
+fn executable_is_denylisted(executable: &str, denylist: &str) -> bool {
+    Path::new(executable)
+        .file_name()
+        .is_some_and(|name| denylist.split_ascii_whitespace().any(|item| name == item))
 }
 
 pub fn inspect(config: &Config, pane: &str) -> Result<PaneRuntime> {
@@ -394,10 +427,11 @@ pub fn restart_disposition(
         .or_else(|| std::env::var("TMUX_ATELIER_CLI").ok())
         .ok_or_else(|| err("@atelier_cli is not configured"))?;
     let mut command = format!(
-        "{} internal pane-run --shell {} --executable {}",
+        "{} internal pane-run --shell {} --executable {} --debug-log {}",
         quote_sh(&cli),
         quote_sh(&shell.executable),
-        quote_sh(&process.executable)
+        quote_sh(&process.executable),
+        quote_sh(&config.debug_log.to_string_lossy())
     );
     if shell.login {
         command.push_str(" --login");
@@ -488,5 +522,11 @@ mod tests {
     fn cmdline_rejects_empty_and_non_utf8_input() {
         assert!(parse_cmdline(b"").is_err());
         assert!(parse_cmdline(&[0xff, 0]).is_err());
+    }
+
+    #[test]
+    fn denylist_applies_to_the_saved_root_executable() {
+        assert!(!executable_is_denylisted("/usr/bin/opencode", "node npm"));
+        assert!(executable_is_denylisted("/usr/bin/node", "node npm"));
     }
 }

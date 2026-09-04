@@ -6,10 +6,11 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::Config;
+use crate::config::{Config, shell_debug};
 use crate::process;
 use crate::process_state::{
-    self, ObservedForeground, ProcessInspector, RestartPolicy, SavedProcess, SavedShell,
+    self, CaptureDecision, ObservedForeground, PaneRuntime, ProcessInspector, RestartPolicy,
+    SavedProcess, SavedShell,
 };
 use crate::workspace::{self, Workspace};
 use crate::{Result, err};
@@ -125,8 +126,21 @@ struct PlannedPane {
     policy: RestartPolicy,
     shell: Option<SavedShell>,
     command: Option<String>,
+    launch: Option<LaunchMetadata>,
     warning: Option<String>,
     expected: Option<(String, ObservedForeground)>,
+}
+
+enum LaunchMetadata {
+    Process {
+        program: String,
+        executable: String,
+        arguments: usize,
+    },
+    Shell {
+        executable: String,
+        login: bool,
+    },
 }
 
 impl Snapshot {
@@ -639,8 +653,16 @@ pub fn plan_processes(
             };
             for (ordinal, pane) in window.panes.iter().enumerate() {
                 let mut command = None;
+                let mut launch = None;
                 let mut warning = None;
                 let mut expected = None;
+                let mut plan_reason = if !enabled {
+                    "process-restoration-disabled"
+                } else if pane.shell.is_none() {
+                    "shell-not-captured"
+                } else {
+                    "no-saved-process"
+                };
                 if enabled && let Some(shell) = &pane.shell {
                     let already_running = if let (Some(inspector), Some(saved), Some(pane_id)) =
                         (&inspector, &pane.process, pane_ids.get(ordinal))
@@ -649,6 +671,7 @@ pub fn plan_processes(
                         expected = Some((pane_id.clone(), current.clone()));
                         if matches!(&current, ObservedForeground::Process(process) if process.argv == saved.argv)
                         {
+                            plan_reason = "already-running";
                             true
                         } else {
                             let key = process_key(&workspace.name, window.index, ordinal);
@@ -668,18 +691,38 @@ pub fn plan_processes(
                         if let Some(saved) = &pane.process {
                             match process_state::restart_disposition(config, shell, saved)? {
                                 process_state::RestartDisposition::Runnable(value) => {
-                                    command = Some(value)
+                                    command = Some(value);
+                                    launch = Some(LaunchMetadata::Process {
+                                        program: saved
+                                            .argv
+                                            .first()
+                                            .cloned()
+                                            .unwrap_or_else(|| saved.executable.clone()),
+                                        executable: saved.executable.clone(),
+                                        arguments: saved.argv.len(),
+                                    });
+                                    plan_reason = "launch-process";
                                 }
                                 process_state::RestartDisposition::ShellOnly {
                                     command: value,
                                     warning: value_warning,
                                 } => {
                                     command = Some(value);
+                                    launch = Some(LaunchMetadata::Shell {
+                                        executable: shell.executable.clone(),
+                                        login: shell.login,
+                                    });
                                     warning = Some(value_warning);
+                                    plan_reason = "unsupported-shell-fallback";
                                 }
                             }
                         } else if !live_matches {
                             command = Some(process_state::shell_command(shell));
+                            launch = Some(LaunchMetadata::Shell {
+                                executable: shell.executable.clone(),
+                                login: shell.login,
+                            });
+                            plan_reason = "launch-shell";
                         }
                     }
                 }
@@ -688,6 +731,11 @@ pub fn plan_processes(
                 } else {
                     definition.path.clone()
                 };
+                let location = format!("{}:{}.{}", workspace.name, window.index, ordinal);
+                let _ = config.debug(&format!(
+                    "restore pane planned location={location} action={plan_reason} {}",
+                    launch_debug(launch.as_ref())
+                ));
                 planned.push(PlannedPane {
                     workspace: workspace.name.clone(),
                     window: window.index,
@@ -696,6 +744,7 @@ pub fn plan_processes(
                     policy: pane.policy,
                     shell: enabled.then(|| pane.shell.clone()).flatten(),
                     command,
+                    launch,
                     warning,
                     expected,
                 });
@@ -753,7 +802,12 @@ pub fn apply_processes(config: &Config, plan: ProcessPlan) -> Vec<String> {
     })();
     let pane_ids = match validation {
         Ok(pane_ids) => pane_ids,
-        Err(error) => return vec![format!("skipped process restoration: {error}")],
+        Err(error) => {
+            let _ = config.debug(&format!(
+                "restore process plan rejected before launch error={error}"
+            ));
+            return vec![format!("skipped process restoration: {error}")];
+        }
     };
     let mut failures = Vec::new();
     for (pane, pane_id) in plan.panes.into_iter().zip(pane_ids) {
@@ -765,6 +819,13 @@ pub fn apply_processes(config: &Config, plan: ProcessPlan) -> Vec<String> {
             if pane_id != *expected_id
                 || !matches!(current, Ok(runtime) if runtime.foreground == *expected_foreground)
             {
+                let _ = config.debug(&format!(
+                    "restore pane launch skipped location={}:{}.{} pane={pane_id} reason=pane-changed {}",
+                    pane.workspace,
+                    pane.window,
+                    pane.pane,
+                    launch_debug(pane.launch.as_ref())
+                ));
                 failures.push(format!(
                     "skipped {}:{}.{} because the pane changed",
                     pane.workspace, pane.window, pane.pane
@@ -775,7 +836,12 @@ pub fn apply_processes(config: &Config, plan: ProcessPlan) -> Vec<String> {
         let result = (|| -> Result<()> {
             process_state::set_pane_policy(config, &pane_id, pane.policy)?;
             if let Some(command) = &pane.command {
-                process::tmux(
+                let location = format!("{}:{}.{}", pane.workspace, pane.window, pane.pane);
+                let launch = launch_debug(pane.launch.as_ref());
+                let _ = config.debug(&format!(
+                    "restore pane launch requested location={location} pane={pane_id} {launch}"
+                ));
+                let launch_result = process::tmux(
                     config,
                     &[
                         "respawn-pane",
@@ -786,7 +852,20 @@ pub fn apply_processes(config: &Config, plan: ProcessPlan) -> Vec<String> {
                         &pane.path,
                         command,
                     ],
-                )?;
+                );
+                match launch_result {
+                    Ok(()) => {
+                        let _ = config.debug(&format!(
+                            "restore pane launch accepted location={location} pane={pane_id} {launch}"
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = config.debug(&format!(
+                            "restore pane launch rejected location={location} pane={pane_id} {launch} error={error}"
+                        ));
+                        return Err(error);
+                    }
+                }
             }
             if let Some(shell) = &pane.shell {
                 process_state::set_shell_override(config, &pane_id, shell)?;
@@ -841,6 +920,7 @@ fn capture_workspace(
             panes.push(if destination == "local" {
                 let (policy, shell, process) = if let Some(inspector) = inspector {
                     let runtime = inspector.inspect(config, &pane_id)?;
+                    log_capture_transition(config, &pane_id, &runtime);
                     (runtime.policy, runtime.shell, runtime.restartable)
                 } else {
                     (process_state::pane_policy(config, &pane_id)?, None, None)
@@ -874,6 +954,104 @@ fn capture_workspace(
         active_window: topology.active_window,
         windows,
     }))
+}
+
+fn launch_debug(launch: Option<&LaunchMetadata>) -> String {
+    match launch {
+        Some(LaunchMetadata::Process {
+            program,
+            executable,
+            arguments,
+        }) => format!(
+            "kind=process program={} executable={} arguments={arguments}",
+            shell_debug(program),
+            shell_debug(executable)
+        ),
+        Some(LaunchMetadata::Shell { executable, login }) => format!(
+            "kind=shell executable={} login={login}",
+            shell_debug(executable)
+        ),
+        None => "kind=unknown".into(),
+    }
+}
+
+fn log_capture_transition(config: &Config, pane: &str, runtime: &PaneRuntime) {
+    let (decision, details, identity) = match (&runtime.capture, &runtime.foreground) {
+        (CaptureDecision::Idle, _) => ("idle", String::new(), String::new()),
+        (CaptureDecision::Busy { processes }, _) => (
+            "busy",
+            format!(" processes={processes}"),
+            format!("{processes}"),
+        ),
+        (decision, ObservedForeground::Process(process)) => {
+            let program = process
+                .argv
+                .first()
+                .map(String::as_str)
+                .unwrap_or(&process.executable);
+            let common = format!(
+                " program={} executable={} arguments={}",
+                shell_debug(program),
+                shell_debug(&process.executable),
+                process.argv.len()
+            );
+            let identity = format!("{}|{}|{}", process.executable, program, process.argv.len());
+            match decision {
+                CaptureDecision::Never => ("policy-never", common, identity),
+                CaptureDecision::TooYoung { runtime, minimum } => (
+                    "too-young",
+                    format!(
+                        "{common} runtime_ms={} minimum_ms={}",
+                        runtime.as_millis(),
+                        minimum.as_millis()
+                    ),
+                    identity,
+                ),
+                CaptureDecision::Denylisted { executable } => (
+                    "denylisted",
+                    format!("{common} denied={}", shell_debug(executable)),
+                    identity,
+                ),
+                CaptureDecision::Restartable => ("restartable", common, identity),
+                CaptureDecision::Idle | CaptureDecision::Busy { .. } => return,
+            }
+        }
+        _ => return,
+    };
+    let state = format!("{}|{decision}|{identity}", runtime.policy.as_str());
+    let previous = process::tmux_quiet(
+        config,
+        &[
+            "show-options",
+            "-pqv",
+            "-t",
+            pane,
+            "@atelier_restart_capture_log",
+        ],
+    )
+    .unwrap_or_default();
+    if previous == state {
+        return;
+    }
+    if config
+        .debug(&format!(
+            "process capture pane={pane} policy={} decision={decision}{details}",
+            runtime.policy.as_str()
+        ))
+        .is_ok()
+    {
+        let _ = process::tmux(
+            config,
+            &[
+                "set-option",
+                "-pq",
+                "-t",
+                pane,
+                "@atelier_restart_capture_log",
+                &state,
+            ],
+        );
+    }
 }
 
 fn capture_topology(

@@ -61,21 +61,22 @@ impl Config {
 
     pub fn debug(&self, message: &str) -> Result<()> {
         self.secure_dir(&self.state_root)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.debug_log)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        writeln!(
-            file,
-            "{seconds} pid={} pane={} client={} {message}",
-            std::process::id(),
-            shell_debug(&env::var("TMUX_PANE").unwrap_or_default()),
-            shell_debug(&env::var("TMUX_ATELIER_CLIENT").unwrap_or_default())
-        )?;
-        Ok(())
+        debug_to(&self.debug_log, message)
     }
+}
+
+pub fn debug_to(path: &std::path::Path, message: &str) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    writeln!(
+        file,
+        "{seconds} pid={} pane={} client={} {message}",
+        std::process::id(),
+        shell_debug(&env::var("TMUX_PANE").unwrap_or_default()),
+        shell_debug(&env::var("TMUX_ATELIER_CLIENT").unwrap_or_default())
+    )?;
+    Ok(())
 }
 
 pub fn shell_debug(value: &str) -> String {

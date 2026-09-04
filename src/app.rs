@@ -226,6 +226,8 @@ pub(crate) enum InternalCommand {
         login: bool,
         #[arg(long)]
         executable: String,
+        #[arg(long)]
+        debug_log: PathBuf,
         #[arg(required = true, trailing_var_arg = true)]
         argv: Vec<String>,
     },
