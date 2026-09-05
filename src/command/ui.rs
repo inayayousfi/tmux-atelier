@@ -780,7 +780,7 @@ pub(super) fn popup_tab_menu(app: &App, window: &str) -> Result<()> {
     match choices[index] {
         "Rename tab" => defer_request(app, "request-tab-rename", window, &client),
         "Restart after restore" => popup_restart_policy(app, window),
-        "Close tab" => defer_request(app, "request-tab-close", window, &client),
+        "Delete tab" => defer_request(app, "request-tab-close", window, &client),
         _ => Ok(()),
     }
 }
