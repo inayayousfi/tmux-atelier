@@ -773,7 +773,7 @@ pub(super) fn popup_tab_menu(app: &App, window: &str) -> Result<()> {
     app.debug(&format!(
         "tab-menu started window={window} name={name} inherited_client={client}"
     ))?;
-    let choices = ["Rename tab", "Restart after restore", "Close tab"];
+    let choices = ["Rename tab", "Restart after restore", "Delete tab"];
     let Some(index) = choose_action(app, &name, &choices)? else {
         return Ok(());
     };
