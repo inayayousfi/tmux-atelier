@@ -44,8 +44,12 @@ assert_executable_output() {
 }
 
 make_release() {
-    local platform=$1 archive="$RELEASES/tmux-atelier-$1.tar.gz" checksum
-    printf '#!/bin/sh\nprintf "%s binary\\n"\n' "$platform" > "$PAYLOAD/bin/tmux-atelier"
+    local platform=$1 version=${2:-0.4.0} archive="$RELEASES/tmux-atelier-$1.tar.gz" checksum
+    printf '%s\n' '#!/bin/sh' \
+        "if [ \"\${1:-}\" = \"--version\" ]; then" \
+        "    printf 'tmux-atelier %s\\n' '$version'" \
+        "else printf '%s binary\\n' '$platform'" \
+        'fi' > "$PAYLOAD/bin/tmux-atelier"
     printf '%s plugin\n' "$platform" > "$PAYLOAD/tmux-atelier.tmux"
     chmod +x "$PAYLOAD/bin/tmux-atelier"
     tar -C "$PAYLOAD" -czf "$archive" bin/tmux-atelier tmux-atelier.tmux
@@ -62,6 +66,17 @@ run_installer() {
         TMUX_ATELIER_RELEASE_BASE_URL="file://$RELEASES" \
         TMUX_ATELIER_INSTALL_DIR="$destination" \
         "$ROOT/install.sh"
+}
+
+run_update() {
+    local home=$1
+    env \
+        HOME="$home" \
+        TMUX_ATELIER_UNAME_S=Linux \
+        TMUX_ATELIER_UNAME_M=x86_64 \
+        TMUX_ATELIER_RELEASE_BASE_URL="file://$RELEASES" \
+        TMUX_ATELIER_LATEST_VERSION_URL="file://$TEST_ROOT/latest.json" \
+        "$ROOT/install.sh" --update
 }
 
 mkdir -p "$RELEASES" "$PAYLOAD/bin"
@@ -93,6 +108,8 @@ output=$(env -u XDG_CONFIG_HOME \
 default_dir="$home/.config/tmux/tmux-atelier"
 assert_equal "run-shell '$default_dir/tmux-atelier.tmux'" "$output" 'unset XDG_CONFIG_HOME uses the documented default path'
 assert_file_content 'linux-x86_64 plugin' "$default_dir/tmux-atelier.tmux" 'default installation contains the plugin'
+expected_state=$(printf 'install_dir=%s\nplatform=linux-x86_64\nversion=0.4.0' "$default_dir")
+assert_file_content "$expected_state" "$home/.local/state/tmux-atelier/install.state" 'installation records its state'
 
 xdg="$TEST_ROOT/xdg"
 tmux_config="$home/.tmux.conf"
@@ -140,5 +157,20 @@ run_installer Linux x86_64 "$atomic_dir" > /dev/null
 assert_executable_output 'linux-x86_64 binary' "$atomic_dir/bin/tmux-atelier" 'verified release replaces the previous binary'
 [[ ! -e $atomic_dir/old-extra ]] || fail 'installation is replaced as a complete directory'
 pass 'installation is replaced as a complete directory'
+
+printf '{"tag_name":"v0.5.0"}\n' > "$TEST_ROOT/latest.json"
+make_release linux-x86_64 0.5.0
+update_output=$(run_update "$home")
+update_dir="$xdg/tmux/tmux-atelier"
+assert_equal "run-shell '$update_dir/tmux-atelier.tmux'" "$update_output" 'update prints the tmux command'
+assert_executable_output 'linux-x86_64 binary' "$update_dir/bin/tmux-atelier" 'update replaces the installed binary'
+expected_state=$(printf 'install_dir=%s\nplatform=linux-x86_64\nversion=0.5.0' "$update_dir")
+assert_file_content "$expected_state" "$home/.local/state/tmux-atelier/install.state" 'update records the new version'
+
+if run_update "$home" > "$TEST_ROOT/already-updated.out"; then
+    assert_file_content 'tmux-atelier 0.5.0 is already up to date' "$TEST_ROOT/already-updated.out" 'update skips an up-to-date installation'
+else
+    fail 'update accepts an up-to-date installation'
+fi
 
 printf '1..%d\n' "$TESTS"

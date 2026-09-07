@@ -37,6 +37,8 @@ run-shell ~/.config/tmux/tmux-atelier/tmux-atelier.tmux
 
 Reload tmux and press your prefix followed by `N` to make your first workspace. If you keep plugins somewhere else, the installer accepts `--install-dir`.
 
+Update an existing installation with `curl -fsSL https://raw.githubusercontent.com/inayayousfi/tmux-atelier/main/install.sh | bash -s -- --update`.
+
 The installer supports Linux x86-64, Linux ARM64, and macOS Apple Silicon. Remote workspaces use the OpenSSH configuration and credentials you already have.
 
 ## Guide
