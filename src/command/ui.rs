@@ -52,21 +52,20 @@ fn refresh_status_locked(app: &App) -> Result<()> {
     for session in workspace::session_names(app) {
         let line = status_line_for(app, &session, &names, &tokens, &clients)?;
         let target = format!("={session}:");
-        process::tmux(
-            app,
-            &[
-                "set-option",
-                "-q",
-                "-t",
-                &target,
-                "status-format[0]",
-                &status_format,
-            ],
-        )?;
-        process::tmux(
-            app,
-            &["set-option", "-q", "-t", &target, "status-format[1]", &line],
-        )?;
+        for (option, value) in [
+            ("status-format[0]", status_format.as_str()),
+            ("status-format[1]", line.as_str()),
+        ] {
+            if let Err(error) =
+                process::tmux(app, &["set-option", "-q", "-t", &target, option, value])
+            {
+                // Session lifecycle hooks can invalidate the earlier session list.
+                if workspace::session_exists(app, &session) {
+                    return Err(error);
+                }
+                break;
+            }
+        }
     }
     if let Some(options) = process::tmux_quiet(app, &["show-options", "-g"]) {
         let current = format!("@atelier_range_a{generation:x}_");

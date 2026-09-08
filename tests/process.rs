@@ -375,6 +375,29 @@ fn plugin_adapter_configures_options_bindings_and_hooks() {
 }
 
 #[test]
+fn status_refresh_tolerates_a_session_closing_during_refresh() {
+    let env = TestEnv::new();
+    env.tmux_ok(["new-session", "-d", "-s", "steady"]);
+    env.tmux_ok(["new-session", "-d", "-s", "closing"]);
+
+    let output = env
+        .command(&env.cli)
+        .env("TMUX_ATELIER_TEST_KILL_SESSION_ON_STATUS", "closing")
+        .args(["internal", "refresh-status"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        env.tmux_text(["list-sessions", "-F", "#{session_name}"]),
+        "steady"
+    );
+}
+
+#[test]
 fn drag_tracking_is_isolated_and_cleans_every_temporary_resource() {
     let env = TestEnv::new();
     env.tmux_ok(["new-session", "-d", "-s", "native"]);

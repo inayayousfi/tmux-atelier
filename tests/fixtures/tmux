@@ -2,4 +2,11 @@
 
 set -euo pipefail
 : "${TMUX_ATELIER_REAL_TMUX:?}"
+
+if [[ -n "${TMUX_ATELIER_TEST_KILL_SESSION_ON_STATUS:-}" \
+    && " $* " == *" -t =${TMUX_ATELIER_TEST_KILL_SESSION_ON_STATUS}: status-format[0] "* ]]; then
+    "$TMUX_ATELIER_REAL_TMUX" -L "${TMUX_ATELIER_TEST_SOCKET:?}" -f /dev/null \
+        kill-session -t "=${TMUX_ATELIER_TEST_KILL_SESSION_ON_STATUS}" 2>/dev/null || true
+fi
+
 exec "$TMUX_ATELIER_REAL_TMUX" -L "${TMUX_ATELIER_TEST_SOCKET:?}" -f /dev/null "$@"
