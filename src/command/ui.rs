@@ -448,12 +448,6 @@ pub(super) fn cleanup_drags(app: &App) -> Result<()> {
 
 fn configure_drag_table(app: &App, client_id: &str) -> Result<()> {
     let table = drag_table(client_id);
-    let scrollbar_slider = process::tmux_quiet(app, &["list-keys", "-a"]).is_some_and(|keys| {
-        keys.lines().any(|line| {
-            line.split_ascii_whitespace()
-                .any(|field| field == "MouseDrag1ScrollbarSlider")
-        })
-    });
     process::tmux_success(app, &["unbind-key", "-a", "-T", &table]);
     let target = drag_option("target", client_id);
     let clear_motion =
@@ -466,19 +460,16 @@ fn configure_drag_table(app: &App, client_id: &str) -> Result<()> {
         app,
         &["bind-key", "-r", "-T", &table, "MouseDrag1Status", &update],
     )?;
-    let mut motion_keys = vec![
+    for key in [
         "MouseDrag1StatusDefault",
         "MouseDrag1StatusLeft",
         "MouseDrag1StatusRight",
         "MouseDrag1Pane",
         "MouseDrag1Border",
+        "MouseDrag1ScrollbarSlider",
         "MouseDrag1ScrollbarUp",
         "MouseDrag1ScrollbarDown",
-    ];
-    if scrollbar_slider {
-        motion_keys.push("MouseDrag1ScrollbarSlider");
-    }
-    for key in motion_keys {
+    ] {
         bind_drag_action(app, &table, key, &clear_motion)?;
     }
     for control in 0..=9 {
@@ -499,12 +490,13 @@ fn configure_drag_table(app: &App, client_id: &str) -> Result<()> {
     let cancel = format!(
         "run-shell \"exec {executable} internal drag-cancel {client_id} \\\"#{{client_name}}\\\"\""
     );
-    let mut cancel_keys = vec![
+    for key in [
         "MouseDragEnd1StatusDefault",
         "MouseDragEnd1StatusLeft",
         "MouseDragEnd1StatusRight",
         "MouseDragEnd1Pane",
         "MouseDragEnd1Border",
+        "MouseDragEnd1ScrollbarSlider",
         "MouseDragEnd1ScrollbarUp",
         "MouseDragEnd1ScrollbarDown",
         "MouseUp1StatusDefault",
@@ -512,14 +504,10 @@ fn configure_drag_table(app: &App, client_id: &str) -> Result<()> {
         "MouseUp1StatusRight",
         "MouseUp1Pane",
         "MouseUp1Border",
+        "MouseUp1ScrollbarSlider",
         "MouseUp1ScrollbarUp",
         "MouseUp1ScrollbarDown",
-    ];
-    if scrollbar_slider {
-        cancel_keys.push("MouseDragEnd1ScrollbarSlider");
-        cancel_keys.push("MouseUp1ScrollbarSlider");
-    }
-    for key in cancel_keys {
+    ] {
         process::tmux(app, &["bind-key", "-T", &table, key, &cancel])?;
     }
     for control in 0..=9 {

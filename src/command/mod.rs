@@ -28,8 +28,10 @@ impl Deref for App {
 
 impl App {
     pub(crate) fn from_env() -> Result<Self> {
+        let config = Config::from_env()?;
+        ensure_supported_tmux(&config)?;
         Ok(Self {
-            config: Config::from_env()?,
+            config,
             interaction: interaction::from_env(),
         })
     }
@@ -240,6 +242,31 @@ impl App {
     }
 }
 
+fn ensure_supported_tmux(config: &Config) -> Result<()> {
+    let output = process::tmux_output(config, &["-V"])?;
+    if tmux_is_supported(&output) {
+        Ok(())
+    } else {
+        Err(err(format!(
+            "tmux 3.6 or newer is required (found {output})"
+        )))
+    }
+}
+
+fn tmux_is_supported(output: &str) -> bool {
+    tmux_version(output).is_some_and(|version| version >= (3, 6))
+}
+
+fn tmux_version(output: &str) -> Option<(u64, u64)> {
+    let version = output.strip_prefix("tmux ")?;
+    let (major, minor) = version.split_once('.')?;
+    let minor = minor
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
 fn allowed_during_restore(command: &Command) -> bool {
     matches!(
         command,
@@ -276,5 +303,19 @@ fn shell_option(app: &App, session: &str, destination: &str) -> String {
         .into()
     } else {
         shell
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tmux_is_supported;
+
+    #[test]
+    fn tmux_support_starts_at_3_6_and_accepts_release_suffixes() {
+        assert!(!tmux_is_supported("tmux 3.5"));
+        assert!(tmux_is_supported("tmux 3.6a"));
+        assert!(tmux_is_supported("tmux 3.7c"));
+        assert!(!tmux_is_supported("3.6"));
+        assert!(!tmux_is_supported("tmux unknown"));
     }
 }

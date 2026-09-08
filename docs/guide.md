@@ -6,7 +6,7 @@ A tmux session is a workspace, a window is a tab, and a pane is a split.
 
 ## Dependencies
 
-Running tmux-atelier requires tmux. OpenSSH is also required when using remote workspaces. The plugin adapter is POSIX `sh` and has no Bash or fzf runtime dependency.
+Running tmux-atelier requires tmux 3.6 or newer. OpenSSH is also required when using remote workspaces. The plugin adapter is POSIX `sh` and has no Bash or fzf runtime dependency.
 
 Building from source requires Rust 1.89 or newer. Bash and ShellCheck are used for the installer and development checks.
 
