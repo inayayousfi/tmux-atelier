@@ -1,6 +1,6 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::App;
@@ -55,7 +55,7 @@ pub(super) fn pane_run(
     if argv.is_empty() {
         return Err(err("pane runner requires a command"));
     }
-    let program = argv.first().map(String::as_str).unwrap_or(executable);
+    let program = &argv[0];
     let _ = crate::config::debug_to(
         debug_log,
         &format!(
@@ -67,24 +67,19 @@ pub(super) fn pane_run(
         ),
     );
     let cli = std::env::current_exe()?;
-    let mut command = format!(
-        "{} internal process-exec --executable {} --",
-        quote_sh(&cli.to_string_lossy()),
-        quote_sh(executable)
-    );
-    for argument in argv {
-        command.push(' ');
-        command.push_str(&quote_sh(argument));
-    }
-    let mut child = Command::new(shell);
+    let mut child = Command::new(cli);
+    child.args([
+        "internal",
+        "process-guard",
+        "--shell",
+        shell,
+        "--executable",
+        executable,
+    ]);
     if login {
-        child.arg("-l");
+        child.arg("--login");
     }
-    let mut child = match child
-        .args(["-i", "-c", &format!("exec {command}")])
-        .process_group(0)
-        .spawn()
-    {
+    let mut child = match child.arg("--").args(argv).process_group(0).spawn() {
         Ok(child) => child,
         Err(error) => {
             let _ = crate::config::debug_to(
@@ -105,43 +100,7 @@ pub(super) fn pane_run(
             child.id()
         ),
     );
-    unsafe {
-        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
-    }
-    if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, child.id() as libc::pid_t) } != 0 {
-        let error = std::io::Error::last_os_error();
-        let _ = crate::config::debug_to(
-            debug_log,
-            &format!(
-                "process launcher terminal handoff failed program={} child_pid={} error={error}",
-                crate::config::shell_debug(program),
-                child.id()
-            ),
-        );
-        return Err(error.into());
-    }
-    let _ = crate::config::debug_to(
-        debug_log,
-        &format!(
-            "process launcher terminal handed off program={} child_pid={}",
-            crate::config::shell_debug(program),
-            child.id()
-        ),
-    );
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(error) => {
-            let _ = crate::config::debug_to(
-                debug_log,
-                &format!(
-                    "process launcher wait failed program={} child_pid={} error={error}",
-                    crate::config::shell_debug(program),
-                    child.id()
-                ),
-            );
-            return Err(error.into());
-        }
-    };
+    let status = run_foreground_child(debug_log, program, &mut child)?;
     let outcome = if let Some(signal) = status.signal() {
         format!("signal={signal}")
     } else {
@@ -155,17 +114,6 @@ pub(super) fn pane_run(
             child.id()
         ),
     );
-    if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) } != 0 {
-        let error = std::io::Error::last_os_error();
-        let _ = crate::config::debug_to(
-            debug_log,
-            &format!(
-                "process launcher terminal reclaim failed program={} error={error}",
-                crate::config::shell_debug(program)
-            ),
-        );
-        return Err(error.into());
-    }
     if !status.success() {
         if let Some(signal) = status.signal() {
             eprintln!(
@@ -200,6 +148,176 @@ pub(super) fn pane_run(
             crate::config::shell_debug(program)
         ),
     );
+    Err(error.into())
+}
+
+fn run_foreground_child(debug_log: &Path, program: &str, child: &mut Child) -> Result<ExitStatus> {
+    let pid = child.id() as libc::pid_t;
+    let status = match wait_for_child(pid) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = terminate_process_group(child);
+            return Err(error.into());
+        }
+    };
+    if !libc::WIFSTOPPED(status) {
+        return Ok(ExitStatus::from_raw(status));
+    }
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher child stopped program={} child_pid={}",
+            crate::config::shell_debug(program),
+            child.id()
+        ),
+    );
+
+    let parent_pgid = unsafe { libc::getpgrp() };
+    if let Err(error) = set_foreground_process_group(pid) {
+        let _ = terminate_process_group(child);
+        log_launcher_error(debug_log, program, child.id(), "terminal handoff", &error);
+        return Err(error);
+    }
+    if unsafe { libc::kill(-pid, libc::SIGCONT) } != 0 {
+        let error: crate::Error = std::io::Error::last_os_error().into();
+        let _ = terminate_process_group(child);
+        let reclaim = set_foreground_process_group(parent_pgid);
+        log_launcher_error(debug_log, program, child.id(), "child resume", &error);
+        if let Err(reclaim) = reclaim {
+            log_launcher_error(debug_log, program, child.id(), "terminal reclaim", &reclaim);
+        }
+        return Err(error);
+    }
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher terminal handed off program={} child_pid={}",
+            crate::config::shell_debug(program),
+            child.id()
+        ),
+    );
+
+    let status = wait_for_child(pid);
+    let reclaim = set_foreground_process_group(parent_pgid);
+    let status = match status {
+        Ok(status) if libc::WIFSTOPPED(status) => {
+            let signal = libc::WSTOPSIG(status);
+            let _ = crate::config::debug_to(
+                debug_log,
+                &format!(
+                    "process launcher canceled stopped child program={} child_pid={} signal={signal}",
+                    crate::config::shell_debug(program),
+                    child.id()
+                ),
+            );
+            terminate_process_group(child)
+        }
+        Ok(status) => Ok(ExitStatus::from_raw(status)),
+        Err(error) => {
+            let _ = terminate_process_group(child);
+            Err(error)
+        }
+    };
+    match (status, reclaim) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), reclaim) => {
+            let error: crate::Error = error.into();
+            log_launcher_error(debug_log, program, child.id(), "wait", &error);
+            if let Err(reclaim) = reclaim {
+                log_launcher_error(debug_log, program, child.id(), "terminal reclaim", &reclaim);
+            }
+            Err(error)
+        }
+        (Ok(_), Err(error)) => {
+            log_launcher_error(debug_log, program, child.id(), "terminal reclaim", &error);
+            Err(error)
+        }
+    }
+}
+
+fn wait_for_child(pid: libc::pid_t) -> std::io::Result<i32> {
+    loop {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+        if result == pid {
+            return Ok(status);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn set_foreground_process_group(pgid: libc::pid_t) -> Result<()> {
+    let previous = unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+    if previous == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let result = unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, pgid) };
+    let error = (result != 0).then(std::io::Error::last_os_error);
+    if unsafe { libc::signal(libc::SIGTTOU, previous) } == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    match error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
+}
+
+fn terminate_process_group(child: &mut Child) -> std::io::Result<ExitStatus> {
+    if unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+    }
+    child.wait()
+}
+
+fn log_launcher_error(
+    debug_log: &Path,
+    program: &str,
+    child_pid: u32,
+    phase: &str,
+    error: &crate::Error,
+) {
+    let _ = crate::config::debug_to(
+        debug_log,
+        &format!(
+            "process launcher {phase} failed program={} child_pid={child_pid} error={error}",
+            crate::config::shell_debug(program)
+        ),
+    );
+}
+
+pub(super) fn process_guard(
+    shell: &str,
+    login: bool,
+    executable: &str,
+    argv: &[String],
+) -> Result<()> {
+    if argv.is_empty() {
+        return Err(err("process guard requires argv"));
+    }
+    if unsafe { libc::raise(libc::SIGSTOP) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let cli = std::env::current_exe()?;
+    let mut command = format!(
+        "{} internal process-exec --executable {} --",
+        quote_sh(&cli.to_string_lossy()),
+        quote_sh(executable)
+    );
+    for argument in argv {
+        command.push(' ');
+        command.push_str(&quote_sh(argument));
+    }
+    let mut child = Command::new(shell);
+    if login {
+        child.arg("-l");
+    }
+    let error = child.args(["-i", "-c", &format!("exec {command}")]).exec();
     Err(error.into())
 }
 

@@ -231,6 +231,16 @@ pub(crate) enum InternalCommand {
         #[arg(required = true, trailing_var_arg = true)]
         argv: Vec<String>,
     },
+    ProcessGuard {
+        #[arg(long)]
+        shell: String,
+        #[arg(long)]
+        login: bool,
+        #[arg(long)]
+        executable: String,
+        #[arg(required = true, trailing_var_arg = true)]
+        argv: Vec<String>,
+    },
     ProcessExec {
         #[arg(long)]
         executable: String,

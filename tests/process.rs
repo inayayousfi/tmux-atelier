@@ -2177,6 +2177,13 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
         "script-restore",
         "--detached",
     ]);
+    let shell = env.tmux_text([
+        "display-message",
+        "-p",
+        "-t",
+        "=script-restore:0.0",
+        "#{pane_current_command}",
+    ]);
     let pane = env.tmux_text([
         "display-message",
         "-p",
@@ -2233,6 +2240,39 @@ fn captured_shebang_script_restarts_through_its_interpreter() {
         "restored script did not write its marker: {}\n{}",
         String::from_utf8_lossy(&restore.stderr),
         fs::read_to_string(env.state.join("debug.log")).unwrap_or_default()
+    );
+    let restore_log = fs::read_to_string(env.state.join("debug.log")).unwrap();
+    let stopped = restore_log.find("process launcher child stopped").unwrap();
+    let handed_off = restore_log
+        .find("process launcher terminal handed off")
+        .unwrap();
+    assert!(stopped < handed_off, "{restore_log}");
+    env.tmux_ok(["send-keys", "-t", "=script-restore:0.0", "C-z"]);
+    let returned_to_shell = || {
+        for _ in 0..2000 {
+            if env.tmux_text([
+                "display-message",
+                "-p",
+                "-t",
+                "=script-restore:0.0",
+                "#{pane_current_command}",
+            ]) == shell
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        false
+    };
+    assert!(
+        returned_to_shell(),
+        "restored script did not return to its shell after Ctrl-Z"
+    );
+    let restore_log = fs::read_to_string(env.state.join("debug.log")).unwrap();
+    assert!(
+        restore_log.contains("process launcher canceled stopped child")
+            && restore_log.contains(&format!("signal={}", libc::SIGTSTP)),
+        "{restore_log}"
     );
 }
 

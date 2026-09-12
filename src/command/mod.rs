@@ -186,6 +186,12 @@ impl App {
                 debug_log,
                 argv,
             } => restart::pane_run(&debug_log, &shell, login, &executable, &argv),
+            InternalCommand::ProcessGuard {
+                shell,
+                login,
+                executable,
+                argv,
+            } => restart::process_guard(&shell, login, &executable, &argv),
             InternalCommand::ProcessExec { executable, argv } => {
                 restart::process_exec(&executable, &argv)
             }
@@ -284,6 +290,7 @@ fn allowed_during_restore(command: &Command) -> bool {
                 | InternalCommand::RestoreDiscard
                 | InternalCommand::PollProcesses { .. }
                 | InternalCommand::PaneRun { .. }
+                | InternalCommand::ProcessGuard { .. }
                 | InternalCommand::ProcessExec { .. }
                 | InternalCommand::AdoptSession { .. }
                 | InternalCommand::DebugPath
